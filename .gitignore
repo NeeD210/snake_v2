@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific - model files and experiments
+*.pth
+*.pt
+snake_ai/experiments/
+
+# Large data files
+*.zip
+
+# Generated reports and outputs (keep structure, ignore content)
+reports/*.md
+reports/*.csv
+*.csv
+repro_output*.txt
+
+# Keep important documentation
+!plan.md
+!snake_ai/README.md
+!snake_ai/docs/
+!upgrades/
+!rules/
+
