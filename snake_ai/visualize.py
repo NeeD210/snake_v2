@@ -4,7 +4,6 @@ import numpy as np
 import time
 import torch.nn.functional as F
 from game import SnakeGame
-from game import SnakeGame
 from model import SnakeNet
 from mcts import MCTS
 
@@ -12,10 +11,13 @@ def get_pov_state(game, state):
     """
     Process state to match training POV (Head Up).
     """
-    input_tensor = np.zeros((3, game.board_size, game.board_size), dtype=np.float32)
+    input_tensor = np.zeros((4, game.board_size, game.board_size), dtype=np.float32)
     input_tensor[0] = (state == 1).astype(float) # Body
     input_tensor[1] = (state == 2).astype(float) # Head
     input_tensor[2] = (state == 3).astype(float) # Food
+    hunger_limit = max(1, getattr(game, "hunger_limit", 100))
+    hunger = float(getattr(game, "steps_since_eaten", 0)) / hunger_limit
+    input_tensor[3].fill(hunger)
     
     # Rotate based on direction to enforce POV (Head Up)
     # k=0 (Up) -> 0 rot
@@ -43,6 +45,7 @@ def draw_pov(screen, pov_tensor, start_x, start_y, cell_size):
             # Channel 0: Body (Green)
             # Channel 1: Head (Blue/Cyan)
             # Channel 2: Food (Red)
+            # Channel 3: Hunger (not drawn)
             
             color = (50, 50, 50) # Empty (Dark Grey)
             if pov_tensor[1, y, x] > 0: color = (0, 255, 255) # Head
@@ -76,6 +79,11 @@ def visualize(model_path="snake_net.pth", board_size=10, speed=0.1, debug_inputs
         print(f"Loaded model from {model_path}")
     except FileNotFoundError:
         print("Model file not found! Please run main.py to train first.")
+        return
+    except RuntimeError as e:
+        print("Model file exists, but weights are incompatible with the current architecture.")
+        print("If you recently changed input features/channels, retrain a new model.")
+        print(f"Details: {e}")
         return
 
     model.eval()

@@ -13,6 +13,7 @@ import torch.multiprocessing as mp
 import math
 import psutil
 import subprocess
+import queue
 
 from game import SnakeGame
 from model import SnakeNet
@@ -25,6 +26,7 @@ MEMORY_SIZE = 20000
 EPOCHS = 5         
 GAMES_PER_GEN = 20 
 SIMULATIONS = 100   
+VALUE_LOSS_WEIGHT = 0.5
 
 def get_c_puct(generation):
     """
@@ -45,10 +47,13 @@ def get_temperature_threshold(generation):
     else:
         return 10
 
-def play_game_worker(worker_id, board_size, simulations, generation, c_puct, temp_threshold, request_queue, response_queue):
+def play_games_worker(worker_id, board_size, simulations, generation, c_puct, temp_threshold, n_games, request_queue, response_queue, result_queue):
     """
-    Worker function to play a single game in a separate process.
-    Uses Batched Inference by sending states to the main process via queues.
+    Worker function to play N games in a dedicated process.
+    Uses batched inference by sending states to the main process via queues.
+
+    IMPORTANT: Each process must have a unique (worker_id, response_queue) pair.
+    This avoids cross-talk where one process consumes another's inference response.
     """
     # Re-seed random number generators for this process
     seed = os.getpid() + int(torch.randint(0, 10000, (1,)).item())
@@ -56,72 +61,67 @@ def play_game_worker(worker_id, board_size, simulations, generation, c_puct, tem
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    game = SnakeGame(board_size=board_size)
-    
     # Prediction Client for MCTS
     def predict_client(input_tensor):
-        # input_tensor is a numpy array (3, board, board)
-        # Send request
+        # input_tensor is a numpy array (C, board, board)
         request_queue.put((worker_id, input_tensor))
-        
-        # Wait for response
-        # response should be (policy, value)
         p, v = response_queue.get()
         return p, v
-    
-    # Initialize MCTS with the client function
-    mcts = MCTS(predict_client, n_simulations=simulations, c_puct=c_puct)
-    mcts.reset()
-    
-    game_memory = []
-    steps = 0
-    total_entropy = 0
-    move_count = 0
-    state_tensor = game.reset()
-    
-    while not game.done:
-        # Temperature: High exploration early, greedy later
-        temp = 1.0 if steps < temp_threshold else 0.1
-        
-        action_probs, entropy = mcts.search(game)
-        total_entropy += entropy
-        move_count += 1
-        
-        # Apply temperature
-        if temp == 0:
-            rel_action = np.argmax(action_probs)
-        else:
-            # Sharpen probabilities
-            action_probs = action_probs ** (1/temp)
-            action_probs = action_probs / np.sum(action_probs)
-            rel_action = np.random.choice(len(action_probs), p=action_probs)
 
-        # Convert relative action to absolute action
-        abs_action = (game.direction + (rel_action - 1)) % 4
+    for _ in range(n_games):
+        game = SnakeGame(board_size=board_size)
 
-        # Store input state for training (we need to rotate it as per process_state)
-        # MCTS does this inside predict(), but we need it for memory too
-        # To avoid double computation, we can use the helper again
-        input_state = process_state(game, state_tensor)
-        
-        state_tensor, reward, done = game.step(abs_action)
-        mcts.update_root(rel_action) # Update root with relative action
-        steps += 1
-        
-        game_memory.append([input_state, action_probs, reward])
-        
-        # Break infinite loops
+        # Fresh tree per game
+        mcts = MCTS(predict_client, n_simulations=simulations, c_puct=c_puct)
+        mcts.reset()
 
+        game_memory = []
+        steps = 0
+        total_entropy = 0
+        move_count = 0
+        state_tensor = game.reset()
 
-    # Game finished, process returns
-    avg_entropy = total_entropy / move_count if move_count > 0 else 0
-    return process_game_memory(game_memory), game.score, game.death_reason, avg_entropy, steps
+        while not game.done:
+            # Temperature: High exploration early, greedy later
+            temp = 1.0 if steps < temp_threshold else 0.1
+
+            action_probs, entropy = mcts.search(game)
+            total_entropy += entropy
+            move_count += 1
+
+            # Apply temperature
+            if temp == 0:
+                rel_action = np.argmax(action_probs)
+            else:
+                action_probs = action_probs ** (1 / temp)
+                action_probs = action_probs / np.sum(action_probs)
+                rel_action = np.random.choice(len(action_probs), p=action_probs)
+
+            # Convert relative action to absolute action
+            abs_action = (game.direction + (rel_action - 1)) % 4
+
+            # Store input state for training
+            input_state = process_state(game, state_tensor)
+
+            state_tensor, reward, done = game.step(abs_action)
+            mcts.update_root(rel_action)
+            steps += 1
+
+            game_memory.append([input_state, action_probs, reward])
+
+        avg_entropy = total_entropy / move_count if move_count > 0 else 0
+        result_queue.put((process_game_memory(game_memory), game.score, game.death_reason, avg_entropy, steps))
+
+    result_queue.put(("__done__", worker_id))
 
 def process_state(game, state):
-    input_tensor = np.zeros((3, game.board_size, game.board_size), dtype=np.float32)
+    input_tensor = np.zeros((4, game.board_size, game.board_size), dtype=np.float32)
     input_tensor[0] = (state == 1).astype(float)
     input_tensor[1] = (state == 2).astype(float)
     input_tensor[2] = (state == 3).astype(float)
+    hunger_limit = max(1, getattr(game, "hunger_limit", 100))
+    hunger = float(getattr(game, "steps_since_eaten", 0)) / hunger_limit
+    input_tensor[3].fill(hunger)
     
     # Rotate based on direction to enforce POV (Head Up)
     k = game.direction
@@ -157,6 +157,7 @@ def augment_data(state, policy, value):
 
 def process_game_memory(game_memory):
     processed_samples = []
+    # Keep consistent with MCTS backup discount (see mcts.py Node.update)
     gamma = 0.95
     running_return = 0
     
@@ -197,29 +198,9 @@ class Trainer:
             total_cores = mp.cpu_count()
             self.num_workers = max(1, total_cores - 1)
         
-        # Initialize Queues for Batched Inference
-        # We use a Manager to create Queues that are shareable across processes cleanly
-        # Alternatively, simple mp.Queue passed as args works too and is often faster.
-        # Let's use simple mp.Queue.
-        self.manager = mp.Manager()
-        self.request_queue = self.manager.Queue()
-        self.response_queues = [self.manager.Queue() for _ in range(self.num_workers)]
-        
-        # Persistent Pool
-        self.pool = mp.Pool(processes=self.num_workers)
-        
         print(f"Initializing Trainer with {self.num_workers} workers on device {self.device}")
         print(f"Training will be saved to: {self.run_dir}")
 
-
-    def __del__(self):
-        # Robust cleanup to avoid AttributeError during interpreter shutdown
-        if hasattr(self, 'pool') and self.pool:
-            try:
-                self.pool.close()
-                self.pool.join()
-            except (ImportError, AttributeError):
-                pass # Globals already cleaned up
 
     def train_generation(self):
         print(f"--- Generation {self.generation + 1} ---")
@@ -230,6 +211,8 @@ class Trainer:
         scores = []
         entropies = []
         death_reasons = []
+        total_steps = 0
+        min_score = float('inf')
         
         # Calculate dynamic parameters for this generation
         current_c_puct = get_c_puct(self.generation)
@@ -237,40 +220,40 @@ class Trainer:
         
         print(f"Gen {self.generation+1} Params: C_PUCT={current_c_puct:.2f}, TempThreshold={current_temp_threshold}")
         
-        # Prepare arguments for each game. We cycle through worker IDs
-        tasks = []
-        for i in range(GAMES_PER_GEN):
-            # Assign a worker ID based on task index (round robin)
-            # Be careful: strictly, this ID maps to which queue they listen to.
-            # If we have GAMES_PER_GEN > num_workers, we might have multiple tasks using same queue?
-            # NO. Workers in Pool are distinct processes, but the ID we pass determines the queue.
-            # Ideally, the `worker_id` should be unique to the *Process*, not the Task.
-            # But with starmap, we don't control which process gets which task easily without logic.
-            # WORKAROUND: We assume at most `num_workers` tasks run concurrently. 
-            # We can just pass `i % num_workers` as the ID.
-            # As long as the pool size == num_workers, no two ACTIVE tasks will share an ID?
-            # Actually, if one finishes and another starts on the same process, it's fine.
-            # The risk is if two tasks run parallel on DIFFERENT processes but share ID.
-            # Since pool size = num_workers, we have exactly num_workers concurrency.
-            # So `i % num_workers` is safe IF we distribute tasks such that no collision occurs.
-            # But starmap doesn't guarantee which worker picks what.
-            
-            # BETTER APPROACH: Just include `response_queue` in the args.
-            # Since we can't pickle a list of 100 queues easily or bind them, let's just make
-            # sure we have enough queues for the concurrency. 
-            # Actually, creating a new Queue for each task is expensive.
-            # Let's stick to `worker_id = i % self.num_workers`.
-            # If Pool size is 6, and we launch 20 tasks.
-            # Tasks 0-5 start. They use queues 0-5. Safe.
-            # Task 0 finishes. Task 6 starts, uses queue 0. Safe (Queue 0 is free).
-            # ONLY ISSUE: If Task 6 starts on Worker B (who was doing Task 1), but uses Queue 0 
-            # (which was used by Worker A for Task 0). It works, provided queues are cleared.
-            
-            w_id = i % self.num_workers
-            tasks.append((w_id, self.board_size, SIMULATIONS, self.generation, current_c_puct, current_temp_threshold, self.request_queue, self.response_queues[w_id]))
-        
-        # Start workers
-        async_result = self.pool.starmap_async(play_game_worker, tasks)
+        ctx = mp.get_context("spawn")
+        request_queue = ctx.Queue()
+        response_queues = [ctx.Queue() for _ in range(self.num_workers)]
+        result_queue = ctx.Queue()
+
+        # Split games across dedicated processes (each has a unique response queue)
+        base = GAMES_PER_GEN // self.num_workers
+        rem = GAMES_PER_GEN % self.num_workers
+        games_per_worker = [base + (1 if i < rem else 0) for i in range(self.num_workers)]
+
+        procs = []
+        active_workers = 0
+        for w_id, n_games in enumerate(games_per_worker):
+            if n_games <= 0:
+                continue
+            p = ctx.Process(
+                target=play_games_worker,
+                args=(
+                    w_id,
+                    self.board_size,
+                    SIMULATIONS,
+                    self.generation,
+                    current_c_puct,
+                    current_temp_threshold,
+                    n_games,
+                    request_queue,
+                    response_queues[w_id],
+                    result_queue,
+                ),
+            )
+            p.daemon = True
+            p.start()
+            procs.append(p)
+            active_workers += 1
         
         # Inference Loop (Main Thread)
         self.model.eval()
@@ -279,7 +262,11 @@ class Trainer:
         last_monitor_time = time.time()
         inference_batches = 0
         
-        while not async_result.ready():
+        done_workers = 0
+        results_received = 0
+        expected_results = GAMES_PER_GEN
+
+        while results_received < expected_results:
             # Check for requests
             batch_reqs = []
             
@@ -292,9 +279,9 @@ class Trainer:
                     # If we have something, don't wait much for more
                     # TWEAK: Increased latency to force larger batches
                     timeout = 0.005 if len(batch_reqs) > 0 else 0.01 
-                    req = self.request_queue.get(timeout=timeout)
+                    req = request_queue.get(timeout=timeout)
                     batch_reqs.append(req)
-                except: # queue.Empty (but using mp.Queue it raises Empty exception)
+                except queue.Empty:
                     break
             
             if batch_reqs:
@@ -314,10 +301,31 @@ class Trainer:
                 
                 # Send back results
                 for i, w_id in enumerate(worker_ids):
-                    self.response_queues[w_id].put((policies[i], values[i].item()))
+                    response_queues[w_id].put((policies[i], values[i].item()))
             else:
                  # No requests, sleep briefly to avoid CPU spin
                  time.sleep(0.001)
+
+            # Drain finished game results (non-blocking)
+            while True:
+                try:
+                    msg = result_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "__done__":
+                    done_workers += 1
+                    continue
+
+                samples, score, death_reason, entropy, steps_played = msg
+                new_samples.extend(samples)
+                scores.append(score)
+                death_reasons.append(death_reason)
+                entropies.append(entropy)
+                total_steps += steps_played
+                if score < min_score:
+                    min_score = score
+                results_received += 1
 
             # Monitor periodically
             if time.time() - last_monitor_time > 5:
@@ -344,20 +352,9 @@ class Trainer:
                 inference_batches = 0
                 last_monitor_time = time.time()
 
-        results = async_result.get()
-            
-        # Unpack results
-        total_steps = 0
-        min_score = float('inf')
-        
-        for samples, score, death_reason, entropy, steps_played in results:
-            new_samples.extend(samples)
-            scores.append(score)
-            death_reasons.append(death_reason)
-            entropies.append(entropy)
-            total_steps += steps_played
-            if score < min_score:
-                min_score = score
+        # Ensure workers are cleaned up
+        for p in procs:
+            p.join(timeout=5)
             
         avg_score = sum(scores) / len(scores)
         max_score = max(scores)
@@ -449,10 +446,11 @@ class Trainer:
         self.optimizer.zero_grad()
         p, v = self.model(inputs)
         
-        loss_v = F.mse_loss(v, target_vs)
+        # Huber loss is more stable than pure MSE when returns can be large/outlier-y.
+        loss_v = F.smooth_l1_loss(v, target_vs)
         loss_p = -torch.sum(target_pis * p) / target_pis.size(0)
         
-        total_loss = loss_v + loss_p
+        total_loss = VALUE_LOSS_WEIGHT * loss_v + loss_p
         
         # Calculate Prediction Accuracy
         with torch.no_grad():
@@ -590,7 +588,14 @@ if __name__ == "__main__":
     model_path = os.path.join(run_dir, "snake_net.pth")
     if is_resume and os.path.exists(model_path):
         print(f"Loading existing model from {model_path}...")
-        trainer.model.load_state_dict(torch.load(model_path))
+        try:
+            trainer.model.load_state_dict(torch.load(model_path))
+        except RuntimeError as e:
+            print("\nERROR: Failed to load saved model weights.")
+            print("This usually means the model architecture changed (e.g., input channels/features).")
+            print("Start a new run (no --resume) or keep the old code for that run.")
+            print(f"Details: {e}")
+            raise
     
     print("Starting Training Loop (Ctrl+C to stop)...")
     try:

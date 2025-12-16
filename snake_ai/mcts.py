@@ -84,7 +84,7 @@ class Node:
                     reward=reward
                 )
 
-    def update(self, value, gamma=0.9):
+    def update(self, value, gamma=0.95):
         """
         Backpropagates the value up the tree using discounted returns.
         value: The estimated value of the future (from the child's perspective)
@@ -192,10 +192,13 @@ class MCTS:
     def predict(self, game):
         # Prepare input state
         state = game.get_state()
-        input_tensor = np.zeros((3, game.board_size, game.board_size), dtype=np.float32)
+        input_tensor = np.zeros((4, game.board_size, game.board_size), dtype=np.float32)
         input_tensor[0] = (state == 1).astype(float)
         input_tensor[1] = (state == 2).astype(float)
         input_tensor[2] = (state == 3).astype(float)
+        hunger_limit = max(1, getattr(game, "hunger_limit", 100))
+        hunger = float(getattr(game, "steps_since_eaten", 0)) / hunger_limit
+        input_tensor[3].fill(hunger)
         
         # Rotate based on direction to enforce POV (Head Up)
         k = game.direction

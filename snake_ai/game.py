@@ -14,7 +14,11 @@ class SnakeGame:
         new_game.done = self.done
         new_game.steps = self.steps
         new_game.score = self.score
-        # max_steps is constant, set in init
+        new_game.max_steps = self.max_steps
+        new_game.steps_since_eaten = self.steps_since_eaten
+        new_game.hunger_limit = self.hunger_limit
+        new_game.direction = self.direction
+        new_game.death_reason = self.death_reason
         return new_game
 
     def reset(self):
@@ -37,6 +41,7 @@ class SnakeGame:
         self.max_steps = 100000 # Large limit, relying on starvation instead
         self.score = 0
         self.steps_since_eaten = 0
+        self.hunger_limit = 100
         self.direction = 1 # 1: Right ( Matches the body placement )
         self.death_reason = None # Track why the game ended
         return self.get_state()
@@ -60,7 +65,7 @@ class SnakeGame:
 
         self.steps += 1
         # Starvation check
-        if self.steps_since_eaten >= 100:
+        if self.steps_since_eaten >= self.hunger_limit:
             self.done = True
             self.death_reason = "starvation"
             return self.get_state(), -2.0, True

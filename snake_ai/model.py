@@ -8,8 +8,8 @@ class SnakeNet(nn.Module):
         self.board_size = board_size
         
         # Convolutional Body
-        # Input: 3 channels (Body, Head, Food)
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        # Input: 4 channels (Body, Head, Food, Hunger)
+        self.conv1 = nn.Conv2d(4, 32, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
@@ -33,7 +33,7 @@ class SnakeNet(nn.Module):
         self.value_fc2 = nn.Linear(64, 1)
 
     def forward(self, x):
-        # x shape: (Batch, 3, H, W)
+        # x shape: (Batch, 4, H, W)
         
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
