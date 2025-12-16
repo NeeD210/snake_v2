@@ -38,25 +38,26 @@ In our code:
 The Neural Network acts as a function approximator $f_\theta(s) = (\mathbf{p}, v)$.
 
 ### 3.1 Input: The "Eyes"
-*   **Source**: `game.get_state()` transformed by `process_state`.
-*   **Shape**: `(3, BoardSize, BoardSize)`.
+*   **Source**: the live `SnakeGame` object encoded by `process_state(...)` / `MCTS.predict(...)`.
+*   **Shape**: `(4, BoardSize, BoardSize)`.
 *   **Channels**:
-    1.  **Body**: Binary map of snake body segments.
+    1.  **Body Lifetime / Flow**: a *temporal* encoding of the snake body. Cells closer to the head are higher; the tail is lower. This helps the model learn “the tail will move” vs “this is a solid wall”.
     2.  **Head**: Binary map of the snake's head.
     3.  **Food**: Binary map of the food location.
+    4.  **Hunger**: a constant plane filled with `steps_since_eaten / hunger_limit` (normalized).
 *   **POV Transformation**: Crucially, the board is **rotated** so the snake's head is always facing "UP". This creates **invariance**—a left turn looks the same whether the snake is moving North or East on the global grid.
 
 ### 3.2 Outputs
 1.  **Policy Head ($\mathbf{p}$)**: A probability distribution over 3 actions: `[Left, Straight, Right]`.
     *   *Meaning*: "How promising does each move look immediately?"
-2.  **Value Head ($v$)**: A scalar between -1 and 1.
-    *   **Activation**: `Tanh` (Hyperbolic Tangent) to strictly bound outputs.
-    *   *Meaning*: "How likely am I to win from this state?" (1 = Win, -1 = Lose/Die).
+2.  **Value Head ($v$)**: an *unbounded* scalar (regression target is discounted return).
+    *   **Activation**: no `tanh` (removed to avoid saturation and allow learning multi-apple returns).
+    *   *Meaning*: "Expected discounted return from this state."
 
 ### 3.3 Architecture
 *   **Type**: Convolutional Neural Network (CNN).
-*   **Layer Channels**: `[3 -> 32 -> 64 -> 64]`.
-    *   Input: 3 Channels (Head, Body, Food)
+*   **Layer Channels**: `[4 -> 32 -> 64 -> 64]`.
+    *   Input: 4 Channels (Lifetime Body, Head, Food, Hunger)
     *   Hidden Layers: 32, 64, and 64 filters respectively.
 *   **Body**: 3 Convolutional blocks with Batch Normalization and ReLU. This extracts spatial features (e.g., "Food is 3 blocks ahead", "Corner on the left").
 *   **Dual Heads**: The network splits at the end into the Policy and Value heads (a standard "Two-Headed Monster" architecture).
@@ -85,6 +86,12 @@ For every move in the game, MCTS performs `N` simulations (e.g., 50). Each simul
     *   Update the visit count ($N$) and mean value ($Q$) for every node in the path.
     *   *Note*: Unlike traditional MCTS, we do **not** play random moves to the end of the game ("rollouts"). We trust the NN's value estimate $v$.
 
+### 4.3 Compute-efficient scheduling (important for local machines)
+Training is designed to be usable on a single PC:
+*   **Dynamic sims per move**: fewer MCTS simulations early-game and early generations; extra simulations only in **endgame** where precision matters.
+*   **Dynamic games per generation**: games/gen ramps up across generations instead of being expensive from Gen 1.
+*   **Override**: passing `--sims` or `--games` disables schedules for predictable runtime.
+
 ### 4.2 The Decision
 After `N` simulations, we stop. The "real" policy $\pi$ is derived from the visit counts, not the scores:
 $$ \pi(a) = \frac{N(a)^{\frac{1}{T}}}{\sum N(b)^{\frac{1}{T}}} $$
@@ -107,13 +114,14 @@ The system improves iteratively through **Self-Play**.
 ### Step 2: Goal Calculation
 *   **Game Score**: The number of apples eaten (e.g., 5). This is just for humans to watch.
 *   **Reward Signal**: The "Outcome" for the AI. It comes from the **Reward Mechanisms** in `game.py`:
-    *   **+2** for eating an apple.
-    *   **-1** for dying (hitting a wall or itself).
-    *   **Dynamic Hunger**: Penalty starts at -0.01 and increases over time (forcing the snake to eat).
-    *   **+0.1** for getting closer to food (Reward Shaping).
+    *   **+1.0** for eating food.
+    *   **-2.0** for dying (wall/body).
+    *   **-0.01** per step (time penalty).
+    *   **Distance shaping**: small reward proportional to change in Manhattan distance to food.
+    *   **Hunger/Starvation**: if `steps_since_eaten >= hunger_limit`, episode ends with a penalty.
 *   The game ends (Win/Die/timeout).
 *   The final reward (e.g., -1 for death) is backpropagated to all previous steps in that game (Discounted Return).
-*   **Normalization**: The returns are clipped to `[-1, 1]` to ensure they fit the Value Head's range.
+*   **Normalization**: returns are **not clipped** (the value head is unbounded).
 *   Now we have tuples: `(State, Target_Policy, Target_Value)`.
     *   **State**: What the snake saw.
     *   **Target_Policy**: What MCTS decided was best (Robust).
@@ -124,7 +132,7 @@ The system improves iteratively through **Self-Play**.
 *   The NN is trained to minimize the error:
     $$ Loss = (v - Target\_Value)^2 - \pi \cdot \log(\mathbf{p}) $$
 *   **Policy Loss** (Cross-Entropy): Force NN probability $\mathbf{p}$ to match MCTS distribution $\pi$.
-*   **Value Loss** (MSE): Force NN value prediction $v$ to match actual game outcome.
+*   **Value Loss**: Huber (`smooth_l1`) for stability; weighted vs policy loss.
 *   **Gradient Clipping**: We clip gradients to norm 1.0 to prevent training instability.
 
 ---

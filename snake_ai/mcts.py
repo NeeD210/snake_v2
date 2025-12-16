@@ -124,11 +124,14 @@ class MCTS:
         else:
             self.root = None
 
-    def search(self, game):
+    def search(self, game, n_simulations=None):
         """
         Runs MCTS simulations from the current game state.
         Returns the refined policy (probabilities) and the entropy of the visit counts.
         """
+        sims = self.n_simulations if n_simulations is None else int(n_simulations)
+        if sims <= 0:
+            sims = 1
         if self.root is None:
              self.root = Node(game.get_state(), prior=0, reward=0)
              policy, _ = self.predict(game)
@@ -145,7 +148,7 @@ class MCTS:
                  self.root.expand(policy, valid_moves, game)
                  self._add_dirichlet_noise(self.root, valid_moves)
 
-        for _ in range(self.n_simulations):
+        for _ in range(sims):
             node = self.root
             simulation_game = game.clone()
             
@@ -193,8 +196,20 @@ class MCTS:
         # Prepare input state
         state = game.get_state()
         input_tensor = np.zeros((4, game.board_size, game.board_size), dtype=np.float32)
-        input_tensor[0] = (state == 1).astype(float)
+
+        # Channel 0: Lifetime/flow of the body (temporal information).
+        # Higher value = will remain occupied longer. Tail has the lowest value.
+        snake = getattr(game, "snake", [])
+        L = len(snake)
+        if L > 1:
+            # Skip head (channel 1 covers it). Encode body segments by remaining "lifetime".
+            for i in range(1, L):
+                x, y = snake[i]
+                input_tensor[0, y, x] = (L - i) / L  # tail ~ 1/L, near head ~ (L-1)/L
+
+        # Channel 1: Head
         input_tensor[1] = (state == 2).astype(float)
+        # Channel 2: Food
         input_tensor[2] = (state == 3).astype(float)
         hunger_limit = max(1, getattr(game, "hunger_limit", 100))
         hunger = float(getattr(game, "steps_since_eaten", 0)) / hunger_limit

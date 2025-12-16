@@ -12,7 +12,15 @@ def get_pov_state(game, state):
     Process state to match training POV (Head Up).
     """
     input_tensor = np.zeros((4, game.board_size, game.board_size), dtype=np.float32)
-    input_tensor[0] = (state == 1).astype(float) # Body
+
+    # Channel 0: Lifetime/flow of the body (temporal information).
+    snake = getattr(game, "snake", [])
+    L = len(snake)
+    if L > 1:
+        for i in range(1, L):
+            x, y = snake[i]
+            input_tensor[0, y, x] = (L - i) / L
+
     input_tensor[1] = (state == 2).astype(float) # Head
     input_tensor[2] = (state == 3).astype(float) # Food
     hunger_limit = max(1, getattr(game, "hunger_limit", 100))

@@ -14,19 +14,35 @@ import math
 import psutil
 import subprocess
 import queue
+import traceback
 
 from game import SnakeGame
 from model import SnakeNet
 from mcts import MCTS
 
-# Hyperparameters
-LR = 0.001
+# Hyperparameters (defaults; override via CLI)
+LR = 5e-4
 BATCH_SIZE = 128
-MEMORY_SIZE = 20000 
-EPOCHS = 5         
-GAMES_PER_GEN = 20 
-SIMULATIONS = 100   
+MEMORY_SIZE = 50000
+EPOCHS = 2
+# Only used when schedules are disabled (see USE_SCHEDULES below)
+GAMES_PER_GEN = 20
+SIMULATIONS = 128
 VALUE_LOSS_WEIGHT = 0.5
+
+# Inference batching (defaults; override via CLI)
+INFER_MAX_BATCH = 64
+INFER_TIMEOUT_EMPTY = 0.01
+INFER_TIMEOUT_NONEMPTY = 0.005
+
+# Compute-efficient schedules (enabled by default; can be disabled via CLI)
+USE_SCHEDULES = True
+SIMS_START = 64
+SIMS_MID = 128
+SIMS_END = 200
+SIMS_ENDGAME_MULT = 2  # boost sims only when the board is mostly filled
+GAMES_START = 20
+GAMES_END = 50
 
 def get_c_puct(generation):
     """
@@ -46,6 +62,37 @@ def get_temperature_threshold(generation):
         return 20
     else:
         return 10
+
+
+def get_simulations(generation: int, snake_len: int, board_size: int) -> int:
+    """
+    Compute-efficient simulation schedule:
+    - ramp sims up across generations
+    - spend extra compute only in endgame where precision matters
+    """
+    if generation < 10:
+        base = SIMS_START
+    elif generation < 30:
+        base = SIMS_MID
+    else:
+        base = SIMS_END
+
+    # Endgame boost: only when >75% of the board is filled
+    endgame_threshold = int(0.75 * (board_size * board_size))
+    if snake_len >= endgame_threshold:
+        base *= SIMS_ENDGAME_MULT
+
+    return int(base)
+
+
+def get_games_per_gen(generation: int) -> int:
+    # Linearly ramp games to stabilize training without exploding early compute.
+    if generation <= 0:
+        return GAMES_START
+    if generation >= 30:
+        return GAMES_END
+    t = generation / 30.0
+    return int(round(GAMES_START + t * (GAMES_END - GAMES_START)))
 
 def play_games_worker(worker_id, board_size, simulations, generation, c_puct, temp_threshold, n_games, request_queue, response_queue, result_queue):
     """
@@ -68,55 +115,71 @@ def play_games_worker(worker_id, board_size, simulations, generation, c_puct, te
         p, v = response_queue.get()
         return p, v
 
-    for _ in range(n_games):
-        game = SnakeGame(board_size=board_size)
+    try:
+        for _ in range(n_games):
+            game = SnakeGame(board_size=board_size)
 
-        # Fresh tree per game
-        mcts = MCTS(predict_client, n_simulations=simulations, c_puct=c_puct)
-        mcts.reset()
+            # Fresh tree per game (n_simulations may be adjusted per-move if schedules enabled)
+            mcts = MCTS(predict_client, n_simulations=simulations, c_puct=c_puct)
+            mcts.reset()
 
-        game_memory = []
-        steps = 0
-        total_entropy = 0
-        move_count = 0
-        state_tensor = game.reset()
+            game_memory = []
+            steps = 0
+            total_entropy = 0
+            move_count = 0
+            state_tensor = game.reset()
 
-        while not game.done:
-            # Temperature: High exploration early, greedy later
-            temp = 1.0 if steps < temp_threshold else 0.1
+            while not game.done:
+                # Temperature: High exploration early, greedy later
+                temp = 1.0 if steps < temp_threshold else 0.1
 
-            action_probs, entropy = mcts.search(game)
-            total_entropy += entropy
-            move_count += 1
+                # Dynamic sims: save compute early-game, spend it late-game
+                if USE_SCHEDULES:
+                    mcts.n_simulations = get_simulations(generation, len(game.snake), game.board_size)
 
-            # Apply temperature
-            if temp == 0:
-                rel_action = np.argmax(action_probs)
-            else:
-                action_probs = action_probs ** (1 / temp)
-                action_probs = action_probs / np.sum(action_probs)
-                rel_action = np.random.choice(len(action_probs), p=action_probs)
+                action_probs, entropy = mcts.search(game)
+                total_entropy += entropy
+                move_count += 1
 
-            # Convert relative action to absolute action
-            abs_action = (game.direction + (rel_action - 1)) % 4
+                # Apply temperature
+                if temp == 0:
+                    rel_action = np.argmax(action_probs)
+                else:
+                    action_probs = action_probs ** (1 / temp)
+                    action_probs = action_probs / np.sum(action_probs)
+                    rel_action = np.random.choice(len(action_probs), p=action_probs)
 
-            # Store input state for training
-            input_state = process_state(game, state_tensor)
+                # Convert relative action to absolute action
+                abs_action = (game.direction + (rel_action - 1)) % 4
 
-            state_tensor, reward, done = game.step(abs_action)
-            mcts.update_root(rel_action)
-            steps += 1
+                # Store input state for training
+                input_state = process_state(game, state_tensor)
 
-            game_memory.append([input_state, action_probs, reward])
+                state_tensor, reward, done = game.step(abs_action)
+                mcts.update_root(rel_action)
+                steps += 1
 
-        avg_entropy = total_entropy / move_count if move_count > 0 else 0
-        result_queue.put((process_game_memory(game_memory), game.score, game.death_reason, avg_entropy, steps))
+                game_memory.append([input_state, action_probs, reward])
 
-    result_queue.put(("__done__", worker_id))
+            avg_entropy = total_entropy / move_count if move_count > 0 else 0
+            result_queue.put((process_game_memory(game_memory), game.score, game.death_reason, avg_entropy, steps))
+    except Exception:
+        # Propagate a traceback to the parent so we don't "hang" silently.
+        result_queue.put(("__error__", worker_id, traceback.format_exc()))
+    finally:
+        result_queue.put(("__done__", worker_id))
 
 def process_state(game, state):
     input_tensor = np.zeros((4, game.board_size, game.board_size), dtype=np.float32)
-    input_tensor[0] = (state == 1).astype(float)
+
+    # Channel 0: Lifetime/flow of the body (temporal information).
+    snake = getattr(game, "snake", [])
+    L = len(snake)
+    if L > 1:
+        for i in range(1, L):
+            x, y = snake[i]
+            input_tensor[0, y, x] = (L - i) / L
+
     input_tensor[1] = (state == 2).astype(float)
     input_tensor[2] = (state == 3).astype(float)
     hunger_limit = max(1, getattr(game, "hunger_limit", 100))
@@ -179,12 +242,12 @@ def process_game_memory(game_memory):
     return processed_samples
 
 class Trainer:
-    def __init__(self, run_dir, start_gen=0, num_workers=None):
-        # We'll use 6x6 board as per original
-        self.board_size = 6
+    def __init__(self, run_dir, start_gen=0, num_workers=None, board_size=6):
+        self.board_size = board_size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = SnakeNet(board_size=self.board_size).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=LR)
+        self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99)
         
         self.memory = deque(maxlen=MEMORY_SIZE)
         self.history = []
@@ -218,7 +281,9 @@ class Trainer:
         current_c_puct = get_c_puct(self.generation)
         current_temp_threshold = get_temperature_threshold(self.generation)
         
-        print(f"Gen {self.generation+1} Params: C_PUCT={current_c_puct:.2f}, TempThreshold={current_temp_threshold}")
+        # Allow schedules to control total self-play work per generation
+        games_this_gen = get_games_per_gen(self.generation) if USE_SCHEDULES else GAMES_PER_GEN
+        print(f"Gen {self.generation+1} Params: C_PUCT={current_c_puct:.2f}, TempThreshold={current_temp_threshold}, Games={games_this_gen}")
         
         ctx = mp.get_context("spawn")
         request_queue = ctx.Queue()
@@ -226,8 +291,8 @@ class Trainer:
         result_queue = ctx.Queue()
 
         # Split games across dedicated processes (each has a unique response queue)
-        base = GAMES_PER_GEN // self.num_workers
-        rem = GAMES_PER_GEN % self.num_workers
+        base = games_this_gen // self.num_workers
+        rem = games_this_gen % self.num_workers
         games_per_worker = [base + (1 if i < rem else 0) for i in range(self.num_workers)]
 
         procs = []
@@ -264,7 +329,9 @@ class Trainer:
         
         done_workers = 0
         results_received = 0
-        expected_results = GAMES_PER_GEN
+        expected_results = games_this_gen
+        last_progress_time = time.time()
+        last_results_received = 0
 
         while results_received < expected_results:
             # Check for requests
@@ -273,12 +340,12 @@ class Trainer:
             # Non-blocking collect up to BATCH_SIZE (e.g. 64) OR until empty
             # We want to wait a tiny bit if empty to batch up, but not too long
             start_wait = time.time()
-            while len(batch_reqs) < 64:
+            while len(batch_reqs) < INFER_MAX_BATCH:
                 try:
                     # If we have nothing, wait a bit (latency/throughput trade-off)
                     # If we have something, don't wait much for more
                     # TWEAK: Increased latency to force larger batches
-                    timeout = 0.005 if len(batch_reqs) > 0 else 0.01 
+                    timeout = INFER_TIMEOUT_NONEMPTY if len(batch_reqs) > 0 else INFER_TIMEOUT_EMPTY
                     req = request_queue.get(timeout=timeout)
                     batch_reqs.append(req)
                 except queue.Empty:
@@ -316,6 +383,21 @@ class Trainer:
                 if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "__done__":
                     done_workers += 1
                     continue
+                
+                if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == "__error__":
+                    _tag, w_id, tb = msg
+                    print(f"\n[Worker {w_id}] ERROR:\n{tb}", flush=True)
+                    for p in procs:
+                        try:
+                            p.terminate()
+                        except Exception:
+                            pass
+                    for p in procs:
+                        try:
+                            p.join(timeout=2)
+                        except Exception:
+                            pass
+                    raise RuntimeError(f"Worker {w_id} crashed. See traceback above.")
 
                 samples, score, death_reason, entropy, steps_played = msg
                 new_samples.extend(samples)
@@ -326,9 +408,13 @@ class Trainer:
                 if score < min_score:
                     min_score = score
                 results_received += 1
+                last_progress_time = time.time()
 
             # Monitor periodically
             if time.time() - last_monitor_time > 5:
+                alive = sum(1 for p in procs if p.is_alive())
+                print(f"   [Progress] FinishedGames: {results_received}/{expected_results} | WorkersAlive: {alive}/{active_workers}", flush=True)
+
                 # CPU Usage
                 cpu_pct = psutil.cpu_percent()
                 
@@ -351,6 +437,20 @@ class Trainer:
                 print(f"   [Monitor] CPU: {cpu_pct:.1f}% | GPU Util: {gpu_util} | GPU Mem: {gpu_mem} | Workers: {self.num_workers} | Batch Rate: {inference_batches/5:.1f}/s", flush=True)
                 inference_batches = 0
                 last_monitor_time = time.time()
+
+            # Deadlock protection: if all workers are done but we didn't receive all games, fail fast.
+            if done_workers >= active_workers and results_received < expected_results:
+                raise RuntimeError(
+                    f"All workers finished ({done_workers}/{active_workers}) but only received {results_received}/{expected_results} game results."
+                )
+
+            # Deadlock protection: no progress for too long
+            if time.time() - last_progress_time > 60 and results_received == last_results_received:
+                alive = sum(1 for p in procs if p.is_alive())
+                raise RuntimeError(
+                    f"No progress for 60s (FinishedGames {results_received}/{expected_results}, WorkersAlive {alive}/{active_workers})."
+                )
+            last_results_received = results_received
 
         # Ensure workers are cleaned up
         for p in procs:
@@ -412,9 +512,13 @@ class Trainer:
             avg_pred_acc = 0
             
         duration = time.time() - start_time
+        # Step LR schedule once per generation (after at least one training step)
+        if steps > 0:
+            self.scheduler.step()
+        current_lr = self.optimizer.param_groups[0]["lr"]
         
         print(f"Gen {self.generation+1} Finished. Avg Score: {avg_score:.2f}, Max Score: {max_score}, Loss: {avg_loss:.4f}, Time: {duration:.2f}s")
-        print(f"Stats: Entropy={avg_entropy:.4f}, Steps={avg_steps:.1f}, PredAcc={avg_pred_acc:.1%}, Deaths={death_counts}")
+        print(f"Stats: LR={current_lr:.2e}, Entropy={avg_entropy:.4f}, Steps={avg_steps:.1f}, PredAcc={avg_pred_acc:.1%}, Deaths={death_counts}")
         
         self.history.append({
             'Gen': self.generation + 1, 
@@ -558,7 +662,56 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", nargs='?', const=-1, type=int, help="Resume training. Optional: provide version number (e.g. 1 for train_v1). Default is latest.")
     parser.add_argument("--workers", type=int, default=None, help="Number of worker processes.")
+    parser.add_argument("--board-size", type=int, default=6, help="Board size to train on (e.g. 6 for easier perfect-play learning)")
+    parser.add_argument("--fast", action="store_true", help="Compute-efficient preset (recommended for laptops)")
+    parser.add_argument("--sims", type=int, default=None, help="Base simulations per move (disables schedule if set)")
+    parser.add_argument("--games", type=int, default=None, help="Games per generation (disables schedule if set)")
+    parser.add_argument("--epochs", type=int, default=None, help="Epochs per generation")
+    parser.add_argument("--memory", type=int, default=None, help="Replay buffer size")
+    parser.add_argument("--batch", type=int, default=None, help="Training batch size")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate")
+    parser.add_argument("--infer-batch", type=int, default=None, help="Max inference batch size")
+    parser.add_argument("--infer-wait-empty", type=float, default=None, help="Queue wait (seconds) when empty")
+    parser.add_argument("--infer-wait-nonempty", type=float, default=None, help="Queue wait (seconds) when already batching")
     args = parser.parse_args()
+
+    # Apply CLI overrides / presets (module-level globals)
+    if args.fast:
+        # Aim: reach "fill board once" quickly without melting your CPU.
+        LR = 5e-4
+        BATCH_SIZE = 128
+        MEMORY_SIZE = 30000
+        EPOCHS = 1
+        SIMS_START = 48
+        SIMS_MID = 96
+        SIMS_END = 140
+        SIMS_ENDGAME_MULT = 2
+        GAMES_START = 12
+        GAMES_END = 24
+        INFER_MAX_BATCH = 48
+
+    if args.lr is not None:
+        LR = args.lr
+    if args.batch is not None:
+        BATCH_SIZE = args.batch
+    if args.memory is not None:
+        MEMORY_SIZE = args.memory
+    if args.epochs is not None:
+        EPOCHS = args.epochs
+    if args.infer_batch is not None:
+        INFER_MAX_BATCH = args.infer_batch
+    if args.infer_wait_empty is not None:
+        INFER_TIMEOUT_EMPTY = float(args.infer_wait_empty)
+    if args.infer_wait_nonempty is not None:
+        INFER_TIMEOUT_NONEMPTY = float(args.infer_wait_nonempty)
+
+    # If user pins sims/games, treat it as disabling schedules.
+    if args.sims is not None:
+        SIMULATIONS = int(args.sims)
+        USE_SCHEDULES = False
+    if args.games is not None:
+        GAMES_PER_GEN = int(args.games)
+        USE_SCHEDULES = False
     
     # Setup directories
     # Note: Assuming this script is run from project root, experiments will be at snake_ai/experiments
@@ -582,7 +735,7 @@ if __name__ == "__main__":
                     start_gen = int(last_row['Gen'])
                     print(f"Resuming from Generation {start_gen}")
     
-    trainer = Trainer(run_dir, start_gen=start_gen, num_workers=args.workers)
+    trainer = Trainer(run_dir, start_gen=start_gen, num_workers=args.workers, board_size=args.board_size)
     
     # Load previous model if exists
     model_path = os.path.join(run_dir, "snake_net.pth")

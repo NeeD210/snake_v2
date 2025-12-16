@@ -41,7 +41,8 @@ class SnakeGame:
         self.max_steps = 100000 # Large limit, relying on starvation instead
         self.score = 0
         self.steps_since_eaten = 0
-        self.hunger_limit = 100
+        # Scale with board size so late-game routing on larger boards isn't artificially killed.
+        self.hunger_limit = max(100, self.board_size * self.board_size * 2)
         self.direction = 1 # 1: Right ( Matches the body placement )
         self.death_reason = None # Track why the game ended
         return self.get_state()
@@ -64,6 +65,8 @@ class SnakeGame:
             return self.get_state(), 0, True
 
         self.steps += 1
+        # Small time penalty to discourage loops (still dominated by food/death).
+        step_penalty = -0.01
         # Starvation check
         if self.steps_since_eaten >= self.hunger_limit:
             self.done = True
@@ -102,14 +105,14 @@ class SnakeGame:
             new_head[1] < 0 or new_head[1] >= self.board_size):
             self.done = True
             self.death_reason = "wall"
-            return self.get_state(), -1.0, True
+            return self.get_state(), -2.0, True
 
         # Check collision with self
         # Note: Moving into the tail is safe because the tail will move away
         if new_head in self.snake[:-1]:
              self.done = True
              self.death_reason = "body"
-             return self.get_state(), -1.0, True
+             return self.get_state(), -2.0, True
 
         # Move snake
         self.snake.insert(0, new_head)
@@ -138,6 +141,7 @@ class SnakeGame:
         # If further: old < new -> negative reward
         # Scale 0.05: Enough to guide, not enough to overpower -1.0 death
         reward += (old_dist - new_dist) * 0.05
+        reward += step_penalty
 
         return self.get_state(), reward, False
 
