@@ -15,10 +15,13 @@ import psutil
 import subprocess
 import queue
 import traceback
+import sys
 
 from game import SnakeGame
 from model import SnakeNet
 from mcts import MCTS
+from benchmark import BenchmarkConfig, append_benchmark_csv, run_benchmark
+from encoder import encode_pov
 
 # Hyperparameters (defaults; override via CLI)
 LR = 5e-4
@@ -30,19 +33,35 @@ GAMES_PER_GEN = 20
 SIMULATIONS = 128
 VALUE_LOSS_WEIGHT = 0.5
 
+# Training stability (optional)
+USE_VALUE_TARGET_NORM = False  # Phase 2.2 (optional)
+VALUE_NORM_EPS = 1e-5
+
 # Inference batching (defaults; override via CLI)
 INFER_MAX_BATCH = 64
 INFER_TIMEOUT_EMPTY = 0.01
 INFER_TIMEOUT_NONEMPTY = 0.005
+INFER_MODE = "central"  # "central" (batched inference in main) or "worker" (local inference in each worker)
 
 # Compute-efficient schedules (enabled by default; can be disabled via CLI)
 USE_SCHEDULES = True
 SIMS_START = 64
 SIMS_MID = 128
-SIMS_END = 200
-SIMS_ENDGAME_MULT = 2  # boost sims only when the board is mostly filled
+SIMS_END = 256  # Increased for better endgame precision
+SIMS_ENDGAME_MULT = 2  # boost sims only when the board is mostly filled (>=75%)
 GAMES_START = 20
 GAMES_END = 50
+
+# Dev/Quick mode for fast iteration (reduces compute without hurting learning signal)
+DEV_MODE = False  # Enable via --dev flag
+
+# Multi-size board training (curriculum learning)
+USE_MULTI_SIZE = False  # Enable to train on multiple board sizes
+BOARD_SIZES = [6, 8, 10]  # Sizes to use when multi-size is enabled
+CURRICULUM_MODE = "progressive"  # "progressive" (start small, grow) or "mixed" (random mix)
+CURRICULUM_START_SIZE = 6
+CURRICULUM_END_SIZE = 10
+CURRICULUM_RAMP_GENS = 50  # Generations to ramp from start to end size
 
 def get_c_puct(generation):
     """
@@ -69,34 +88,115 @@ def get_simulations(generation: int, snake_len: int, board_size: int) -> int:
     Compute-efficient simulation schedule:
     - ramp sims up across generations
     - spend extra compute only in endgame where precision matters
+    
+    Endgame boost: When snake covers >=75% of the board, simulations are multiplied
+    by SIMS_ENDGAME_MULT. This is critical because:
+    - Endgame requires perfect play to avoid self-collision
+    - More simulations = better pathfinding through tight spaces
+    - Example: 6x6 board (36 cells), threshold = 27 cells (75%)
+              When snake_len >= 27, sims are doubled
     """
-    if generation < 10:
-        base = SIMS_START
-    elif generation < 30:
-        base = SIMS_MID
+    if DEV_MODE:
+        # Dev mode: much faster, lower sims
+        if generation < 10:
+            base = max(32, SIMS_START // 2)  # Half the sims
+        elif generation < 30:
+            base = max(64, SIMS_MID // 2)
+        else:
+            base = max(96, SIMS_END // 2)
+        # No endgame boost in dev mode
     else:
-        base = SIMS_END
-
-    # Endgame boost: only when >75% of the board is filled
-    endgame_threshold = int(0.75 * (board_size * board_size))
-    if snake_len >= endgame_threshold:
-        base *= SIMS_ENDGAME_MULT
+        if generation < 10:
+            base = SIMS_START
+        elif generation < 30:
+            base = SIMS_MID
+        else:
+            base = SIMS_END
+        
+        # Endgame boost: only when >=75% of the board is filled
+        # This is when precision matters most to avoid self-collision
+        endgame_threshold = int(0.75 * (board_size * board_size))
+        if snake_len >= endgame_threshold:
+            base *= SIMS_ENDGAME_MULT
 
     return int(base)
 
 
 def get_games_per_gen(generation: int) -> int:
     # Linearly ramp games to stabilize training without exploding early compute.
-    if generation <= 0:
-        return GAMES_START
-    if generation >= 30:
-        return GAMES_END
-    t = generation / 30.0
-    return int(round(GAMES_START + t * (GAMES_END - GAMES_START)))
+    if DEV_MODE:
+        # Dev mode: fewer games, faster iteration
+        if generation <= 0:
+            return max(8, GAMES_START // 2)  # Half the games
+        if generation >= 20:  # Ramp faster in dev mode
+            return max(16, GAMES_END // 2)
+        t = generation / 20.0
+        start = max(8, GAMES_START // 2)
+        end = max(16, GAMES_END // 2)
+        return int(round(start + t * (end - start)))
+    else:
+        if generation <= 0:
+            return GAMES_START
+        if generation >= 30:
+            return GAMES_END
+        t = generation / 30.0
+        return int(round(GAMES_START + t * (GAMES_END - GAMES_START)))
 
-def play_games_worker(worker_id, board_size, simulations, generation, c_puct, temp_threshold, n_games, request_queue, response_queue, result_queue):
+def get_board_size_for_game(generation: int, game_index: int = None) -> int:
     """
-    Worker function to play N games in a dedicated process.
+    Returns the board size for a specific game based on curriculum learning strategy.
+    
+    Args:
+        generation: Current generation number
+        game_index: Optional game index (for mixed mode randomization)
+    
+    Returns:
+        Board size to use for this game
+    """
+    if not USE_MULTI_SIZE:
+        # Single size mode: return the default (will be overridden by Trainer.board_size)
+        return CURRICULUM_START_SIZE
+    
+    if CURRICULUM_MODE == "progressive":
+        # Progressive: start with small boards, gradually increase
+        if generation <= 0:
+            return CURRICULUM_START_SIZE
+        if generation >= CURRICULUM_RAMP_GENS:
+            return CURRICULUM_END_SIZE
+        
+        # Linear interpolation
+        t = generation / CURRICULUM_RAMP_GENS
+        size = CURRICULUM_START_SIZE + t * (CURRICULUM_END_SIZE - CURRICULUM_START_SIZE)
+        # Round to nearest valid size
+        return int(round(size))
+    
+    elif CURRICULUM_MODE == "mixed":
+        # Mixed: randomly sample from BOARD_SIZES
+        if game_index is not None:
+            # Use game_index for deterministic but varied selection
+            np.random.seed(generation * 1000 + game_index)
+        return int(np.random.choice(BOARD_SIZES))
+    
+    else:
+        # Default: use start size
+        return CURRICULUM_START_SIZE
+
+def play_games_worker(
+    worker_id,
+    board_size,  # Default/fallback size (used if game_queue doesn't specify)
+    simulations,
+    generation,
+    c_puct,
+    temp_threshold,
+    game_queue,
+    request_queue,
+    response_queue,
+    result_queue,
+    infer_mode="central",
+    model_state_dict=None,
+):
+    """
+    Worker function to play games in a dedicated process.
     Uses batched inference by sending states to the main process via queues.
 
     IMPORTANT: Each process must have a unique (worker_id, response_queue) pair.
@@ -108,16 +208,51 @@ def play_games_worker(worker_id, board_size, simulations, generation, c_puct, te
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    # Prediction Client for MCTS
-    def predict_client(input_tensor):
-        # input_tensor is a numpy array (C, board, board)
-        request_queue.put((worker_id, input_tensor))
-        p, v = response_queue.get()
-        return p, v
+    # Prediction client
+    if infer_mode == "worker":
+        # Local inference in each worker removes IPC bottlenecks but requires care
+        # to avoid thread oversubscription.
+        # Note: Model is now size-agnostic, so we can use any board_size for initialization
+        torch.set_num_threads(1)
+        device = torch.device("cpu")
+        local_model = SnakeNet(board_size=board_size).to(device)  # Size doesn't matter anymore
+        if model_state_dict is None:
+            raise RuntimeError("infer_mode='worker' requires model_state_dict")
+        local_model.load_state_dict(model_state_dict)
+        local_model.eval()
+
+        def predict_client(input_tensor):
+            x = torch.from_numpy(input_tensor).unsqueeze(0).to(device)
+            with torch.no_grad():
+                p, v = local_model(x)
+            p = torch.exp(p).squeeze(0).cpu().numpy()
+            return p, float(v.item())
+    else:
+        # Central mode: send requests to the parent, wait for batched inference response.
+        def predict_client(input_tensor):
+            request_queue.put((worker_id, input_tensor))
+            p, v = response_queue.get()
+            return p, v
 
     try:
-        for _ in range(n_games):
-            game = SnakeGame(board_size=board_size)
+        # Dynamic scheduling: pull games from a shared queue.
+        # Faster workers will naturally execute more games.
+        while True:
+            # IMPORTANT (Windows spawn): using get_nowait() can observe an "empty"
+            # queue briefly during startup due to feeder-thread timing, causing
+            # workers to exit prematurely. We use a blocking get() + sentinels.
+            _game_token = game_queue.get()
+            if _game_token is None:
+                break
+            
+            # Support dynamic board sizes: game_token can be (game_id, board_size) or just game_id
+            if isinstance(_game_token, tuple):
+                game_id, game_board_size = _game_token
+            else:
+                game_id = _game_token
+                game_board_size = board_size  # Fallback to default
+            
+            game = SnakeGame(board_size=game_board_size)
 
             # Fresh tree per game (n_simulations may be adjusted per-move if schedules enabled)
             mcts = MCTS(predict_client, n_simulations=simulations, c_puct=c_puct)
@@ -163,6 +298,11 @@ def play_games_worker(worker_id, board_size, simulations, generation, c_puct, te
 
             avg_entropy = total_entropy / move_count if move_count > 0 else 0
             result_queue.put((process_game_memory(game_memory), game.score, game.death_reason, avg_entropy, steps))
+    except KeyboardInterrupt:
+        # On Windows spawn, Ctrl+C is often delivered to child processes too.
+        # If we don't catch it, multiprocessing prints a noisy traceback for each worker.
+        # Exiting cleanly here is expected behavior when the user cancels training.
+        return
     except Exception:
         # Propagate a traceback to the parent so we don't "hang" silently.
         result_queue.put(("__error__", worker_id, traceback.format_exc()))
@@ -170,27 +310,7 @@ def play_games_worker(worker_id, board_size, simulations, generation, c_puct, te
         result_queue.put(("__done__", worker_id))
 
 def process_state(game, state):
-    input_tensor = np.zeros((4, game.board_size, game.board_size), dtype=np.float32)
-
-    # Channel 0: Lifetime/flow of the body (temporal information).
-    snake = getattr(game, "snake", [])
-    L = len(snake)
-    if L > 1:
-        for i in range(1, L):
-            x, y = snake[i]
-            input_tensor[0, y, x] = (L - i) / L
-
-    input_tensor[1] = (state == 2).astype(float)
-    input_tensor[2] = (state == 3).astype(float)
-    hunger_limit = max(1, getattr(game, "hunger_limit", 100))
-    hunger = float(getattr(game, "steps_since_eaten", 0)) / hunger_limit
-    input_tensor[3].fill(hunger)
-    
-    # Rotate based on direction to enforce POV (Head Up)
-    k = game.direction
-    input_tensor = np.rot90(input_tensor, k, axes=(1, 2)).copy()
-    
-    return input_tensor
+    return encode_pov(game, state)
 
 def augment_data(state, policy, value):
     """
@@ -241,10 +361,60 @@ def process_game_memory(game_memory):
         
     return processed_samples
 
+class RunningMeanStd:
+    """
+    Numerically-stable running mean/std (Welford-style) for scalar targets.
+    Used to normalize value targets to reduce gradient scale spikes.
+    """
+
+    def __init__(self, eps: float = 1e-4):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = float(eps)
+
+    def update(self, x) -> None:
+        """
+        Update running mean/var from a batch of scalars.
+        Accepts either a torch.Tensor or a numpy-like array.
+        """
+        if torch.is_tensor(x):
+            if x.numel() == 0:
+                return
+            # Avoid materializing the whole tensor on CPU (keep stats as floats only).
+            # Note: use unbiased=False for population variance.
+            batch_mean = float(x.detach().mean().item())
+            batch_var = float(x.detach().var(unbiased=False).item())
+            batch_count = float(x.numel())
+        else:
+            x = np.asarray(x, dtype=np.float64).reshape(-1)
+            if x.size == 0:
+                return
+            batch_mean = float(x.mean())
+            batch_var = float(x.var())
+            batch_count = float(x.size)
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / tot_count
+
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + (delta * delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = max(new_var, 0.0)
+        self.count = tot_count
+
+    @property
+    def std(self) -> float:
+        return float(math.sqrt(self.var) + VALUE_NORM_EPS)
+
 class Trainer:
     def __init__(self, run_dir, start_gen=0, num_workers=None, board_size=6):
-        self.board_size = board_size
+        self.board_size = board_size  # Default/fallback size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Model is now size-agnostic, so board_size parameter is just for compatibility
         self.model = SnakeNet(board_size=self.board_size).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=LR)
         self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99)
@@ -253,6 +423,13 @@ class Trainer:
         self.history = []
         self.generation = start_gen
         self.run_dir = run_dir
+        self.value_rms = RunningMeanStd() if USE_VALUE_TARGET_NORM else None
+        self.best_avg_score = -float('inf')
+        self.best_benchmark_score = -float('inf')  # Best benchmark AvgScore
+        self.best_benchmark_winpct = -float('inf')  # Best benchmark WinPct
+        # Moving average for training avg_score (reduces noise)
+        self.avg_score_window = deque(maxlen=5)  # Last 5 generations
+        self.best_moving_avg_score = -float('inf')
         
         # Determine number of workers
         if num_workers is not None:
@@ -268,6 +445,7 @@ class Trainer:
     def train_generation(self):
         print(f"--- Generation {self.generation + 1} ---")
         start_time = time.time()
+        selfplay_start_time = start_time
         
         # 1. Collection Phase (Parallel)
         new_samples = []
@@ -286,20 +464,39 @@ class Trainer:
         print(f"Gen {self.generation+1} Params: C_PUCT={current_c_puct:.2f}, TempThreshold={current_temp_threshold}, Games={games_this_gen}")
         
         ctx = mp.get_context("spawn")
-        request_queue = ctx.Queue()
-        response_queues = [ctx.Queue() for _ in range(self.num_workers)]
         result_queue = ctx.Queue()
 
-        # Split games across dedicated processes (each has a unique response queue)
-        base = games_this_gen // self.num_workers
-        rem = games_this_gen % self.num_workers
-        games_per_worker = [base + (1 if i < rem else 0) for i in range(self.num_workers)]
+        request_queue = None
+        response_queues = None
+        model_state_dict = None
+
+        if INFER_MODE == "central":
+            request_queue = ctx.Queue()
+            response_queues = [ctx.Queue() for _ in range(self.num_workers)]
+        elif INFER_MODE == "worker":
+            # Snapshot model weights once per generation and ship to workers.
+            model_state_dict = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
+        else:
+            raise ValueError(f"Unknown INFER_MODE: {INFER_MODE}")
+
+        # Dynamic scheduling: shared game queue so workers load-balance automatically.
+        game_queue = ctx.Queue()
+        for i in range(games_this_gen):
+            if USE_MULTI_SIZE:
+                # Pass (game_id, board_size) tuple for multi-size training
+                game_board_size = get_board_size_for_game(self.generation, game_index=i)
+                game_queue.put((i, game_board_size))
+            else:
+                # Single size: just pass game_id
+                game_queue.put(i)
+        # One sentinel per worker so everyone can shut down cleanly.
+        for _ in range(self.num_workers):
+            game_queue.put(None)
 
         procs = []
+        proc_by_worker = {}
         active_workers = 0
-        for w_id, n_games in enumerate(games_per_worker):
-            if n_games <= 0:
-                continue
+        for w_id in range(self.num_workers):
             p = ctx.Process(
                 target=play_games_worker,
                 args=(
@@ -309,69 +506,83 @@ class Trainer:
                     self.generation,
                     current_c_puct,
                     current_temp_threshold,
-                    n_games,
+                    game_queue,
                     request_queue,
-                    response_queues[w_id],
+                    (response_queues[w_id] if response_queues is not None else None),
                     result_queue,
+                    INFER_MODE,
+                    model_state_dict,
                 ),
             )
             p.daemon = True
             p.start()
             procs.append(p)
+            proc_by_worker[w_id] = p
             active_workers += 1
         
-        # Inference Loop (Main Thread)
-        self.model.eval()
+        # Inference Loop (Main Thread) - only in central mode
+        if INFER_MODE == "central":
+            self.model.eval()
         
         # Variables for monitoring
         last_monitor_time = time.time()
         inference_batches = 0
+
+        # Telemetry (per-generation)
+        total_inference_batches = 0
+        total_inference_requests = 0
         
         done_workers = 0
+        done_worker_ids = set()
         results_received = 0
         expected_results = games_this_gen
-        last_progress_time = time.time()
+        # We consider the system "making progress" if we are either:
+        # - receiving game results, OR
+        # - processing inference requests from workers.
+        #
+        # A generation can legitimately go a while without finishing a game
+        # (e.g. if the remaining worker is playing a long MCTS-heavy episode),
+        # so "no results for X seconds" is not a reliable deadlock signal.
+        last_activity_time = time.time()
         last_results_received = 0
 
         while results_received < expected_results:
-            # Check for requests
-            batch_reqs = []
-            
-            # Non-blocking collect up to BATCH_SIZE (e.g. 64) OR until empty
-            # We want to wait a tiny bit if empty to batch up, but not too long
-            start_wait = time.time()
-            while len(batch_reqs) < INFER_MAX_BATCH:
-                try:
-                    # If we have nothing, wait a bit (latency/throughput trade-off)
-                    # If we have something, don't wait much for more
-                    # TWEAK: Increased latency to force larger batches
-                    timeout = INFER_TIMEOUT_NONEMPTY if len(batch_reqs) > 0 else INFER_TIMEOUT_EMPTY
-                    req = request_queue.get(timeout=timeout)
-                    batch_reqs.append(req)
-                except queue.Empty:
-                    break
-            
-            if batch_reqs:
-                inference_batches += 1
-                # Process Batch
-                # unzip
-                worker_ids = [r[0] for r in batch_reqs]
-                input_np = np.array([r[1] for r in batch_reqs])
-                
-                input_tensor = torch.tensor(input_np).to(self.device)
-                
-                with torch.no_grad():
-                    policies, values = self.model(input_tensor)
-                    
-                policies = torch.exp(policies).cpu().numpy()
-                values = values.cpu().numpy()
-                
-                # Send back results
-                for i, w_id in enumerate(worker_ids):
-                    response_queues[w_id].put((policies[i], values[i].item()))
+            if INFER_MODE == "central":
+                # Check for requests
+                batch_reqs = []
+
+                # Non-blocking collect up to INFER_MAX_BATCH OR until empty
+                while len(batch_reqs) < INFER_MAX_BATCH:
+                    try:
+                        timeout = INFER_TIMEOUT_NONEMPTY if len(batch_reqs) > 0 else INFER_TIMEOUT_EMPTY
+                        req = request_queue.get(timeout=timeout)
+                        batch_reqs.append(req)
+                    except queue.Empty:
+                        break
+
+                if batch_reqs:
+                    inference_batches += 1
+                    total_inference_batches += 1
+                    total_inference_requests += len(batch_reqs)
+
+                    worker_ids = [r[0] for r in batch_reqs]
+                    input_np = np.array([r[1] for r in batch_reqs])
+                    input_tensor = torch.tensor(input_np).to(self.device)
+
+                    with torch.no_grad():
+                        policies, values = self.model(input_tensor)
+
+                    policies = torch.exp(policies).cpu().numpy()
+                    values = values.cpu().numpy()
+
+                    for i, w_id in enumerate(worker_ids):
+                        response_queues[w_id].put((policies[i], values[i].item()))
+                    last_activity_time = time.time()
+                else:
+                    time.sleep(0.001)
             else:
-                 # No requests, sleep briefly to avoid CPU spin
-                 time.sleep(0.001)
+                # Worker mode: keep loop responsive while workers compute locally.
+                time.sleep(0.001)
 
             # Drain finished game results (non-blocking)
             while True:
@@ -382,6 +593,8 @@ class Trainer:
 
                 if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "__done__":
                     done_workers += 1
+                    done_worker_ids.add(msg[1])
+                    last_activity_time = time.time()
                     continue
                 
                 if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == "__error__":
@@ -408,12 +621,21 @@ class Trainer:
                 if score < min_score:
                     min_score = score
                 results_received += 1
-                last_progress_time = time.time()
+                last_activity_time = time.time()
 
             # Monitor periodically
             if time.time() - last_monitor_time > 5:
                 alive = sum(1 for p in procs if p.is_alive())
                 print(f"   [Progress] FinishedGames: {results_received}/{expected_results} | WorkersAlive: {alive}/{active_workers}", flush=True)
+                # Detect unexpected worker exits early (e.g. hard crash / killed process)
+                for w_id, p in proc_by_worker.items():
+                    if w_id in done_worker_ids:
+                        continue
+                    if p.exitcode is not None and p.exitcode != 0:
+                        raise RuntimeError(
+                            f"Worker process {w_id} exited unexpectedly with exit code {p.exitcode} "
+                            f"(FinishedGames {results_received}/{expected_results})."
+                        )
 
                 # CPU Usage
                 cpu_pct = psutil.cpu_percent()
@@ -434,7 +656,16 @@ class Trainer:
                 except Exception:
                     pass
                     
-                print(f"   [Monitor] CPU: {cpu_pct:.1f}% | GPU Util: {gpu_util} | GPU Mem: {gpu_mem} | Workers: {self.num_workers} | Batch Rate: {inference_batches/5:.1f}/s", flush=True)
+                if INFER_MODE == "central":
+                    batch_rate = f"{inference_batches/5:.1f}/s"
+                else:
+                    batch_rate = "N/A (worker)"
+
+                print(
+                    f"   [Monitor] CPU: {cpu_pct:.1f}% | GPU Util: {gpu_util} | GPU Mem: {gpu_mem} | "
+                    f"Workers: {self.num_workers} | Batch Rate: {batch_rate}",
+                    flush=True,
+                )
                 inference_batches = 0
                 last_monitor_time = time.time()
 
@@ -444,17 +675,22 @@ class Trainer:
                     f"All workers finished ({done_workers}/{active_workers}) but only received {results_received}/{expected_results} game results."
                 )
 
-            # Deadlock protection: no progress for too long
-            if time.time() - last_progress_time > 60 and results_received == last_results_received:
+            # Deadlock protection: no activity for too long (no inference requests and no game results).
+            # This is more reliable than "no finished games" because the last remaining
+            # episode can be long-running while still actively requesting inference.
+            if INFER_MODE == "central" and time.time() - last_activity_time > 60 and results_received == last_results_received:
                 alive = sum(1 for p in procs if p.is_alive())
                 raise RuntimeError(
-                    f"No progress for 60s (FinishedGames {results_received}/{expected_results}, WorkersAlive {alive}/{active_workers})."
+                    f"No activity for 60s (FinishedGames {results_received}/{expected_results}, WorkersAlive {alive}/{active_workers})."
                 )
             last_results_received = results_received
 
         # Ensure workers are cleaned up
         for p in procs:
             p.join(timeout=5)
+
+        selfplay_end_time = time.time()
+        selfplay_time_s = selfplay_end_time - selfplay_start_time
             
         avg_score = sum(scores) / len(scores)
         max_score = max(scores)
@@ -474,6 +710,7 @@ class Trainer:
         self.memory.extend(new_samples)
         
         # 2. Training Phase
+        train_start_time = time.time()
         total_loss = 0
         total_p_loss = 0
         total_v_loss = 0
@@ -481,7 +718,7 @@ class Trainer:
         steps = 0
         
         # Train for epochs
-        self.model.train() # <--- CRITICAL FIX: Switch back to train mode so BatchNorm stats update
+        self.model.train()
         num_batches = len(self.memory) // BATCH_SIZE
         if num_batches > 0:
             for _ in range(EPOCHS):
@@ -510,6 +747,10 @@ class Trainer:
             avg_p_loss = 0
             avg_v_loss = 0
             avg_pred_acc = 0
+
+        train_end_time = time.time()
+        train_time_s = train_end_time - train_start_time
+        avg_infer_batch_size = (total_inference_requests / total_inference_batches) if total_inference_batches > 0 else 0.0
             
         duration = time.time() - start_time
         # Step LR schedule once per generation (after at least one training step)
@@ -519,6 +760,16 @@ class Trainer:
         
         print(f"Gen {self.generation+1} Finished. Avg Score: {avg_score:.2f}, Max Score: {max_score}, Loss: {avg_loss:.4f}, Time: {duration:.2f}s")
         print(f"Stats: LR={current_lr:.2e}, Entropy={avg_entropy:.4f}, Steps={avg_steps:.1f}, PredAcc={avg_pred_acc:.1%}, Deaths={death_counts}")
+        print(
+            f"Telemetry: InferMode={INFER_MODE} | SelfPlay={selfplay_time_s:.2f}s | Train={train_time_s:.2f}s | "
+            f"InferReq={total_inference_requests} | InferBatches={total_inference_batches} | AvgInferBatch={avg_infer_batch_size:.1f}",
+            flush=True,
+        )
+        if USE_VALUE_TARGET_NORM and self.value_rms is not None:
+            print(
+                f"ValueNorm: mean={self.value_rms.mean:.3f} std={self.value_rms.std:.3f} count={int(self.value_rms.count)}",
+                flush=True,
+            )
         
         self.history.append({
             'Gen': self.generation + 1, 
@@ -529,16 +780,35 @@ class Trainer:
             'PolicyLoss': avg_p_loss,
             'ValueLoss': avg_v_loss,
             'PredAcc': avg_pred_acc,
-            'Games': GAMES_PER_GEN,
+            'Games': games_this_gen,
             'Time': duration,
             'AvgSteps': avg_steps,
             'AvgEntropy': avg_entropy,
+            'ValueNormMean': (self.value_rms.mean if (USE_VALUE_TARGET_NORM and self.value_rms is not None) else ""),
+            'ValueNormStd': (self.value_rms.std if (USE_VALUE_TARGET_NORM and self.value_rms is not None) else ""),
             'DeathWall': death_counts['wall'],
             'DeathBody': death_counts['body'],
             'DeathTimeout': death_counts['timeout'],
             'DeathStarvation': death_counts['starvation'],
             'DeathWon': death_counts['won']
         })
+        
+        # Update moving average of avg_score (reduces noise)
+        self.avg_score_window.append(avg_score)
+        moving_avg_score = sum(self.avg_score_window) / len(self.avg_score_window) if self.avg_score_window else avg_score
+        
+        # Save best model based on moving average (more stable than single value)
+        # This helps avoid saving models during temporary spikes
+        if moving_avg_score > self.best_moving_avg_score:
+            previous_best = self.best_moving_avg_score
+            self.best_moving_avg_score = moving_avg_score
+            self.best_avg_score = avg_score  # Keep track of raw best too
+            self.save_best_model()
+            if previous_best > -float('inf'):
+                print(f"New best model saved! MovingAvgScore: {moving_avg_score:.2f} (previous: {previous_best:.2f}, raw: {avg_score:.2f})")
+            else:
+                print(f"New best model saved! MovingAvgScore: {moving_avg_score:.2f} (raw: {avg_score:.2f})")
+        
         self.generation += 1
         return avg_score
 
@@ -551,7 +821,17 @@ class Trainer:
         p, v = self.model(inputs)
         
         # Huber loss is more stable than pure MSE when returns can be large/outlier-y.
-        loss_v = F.smooth_l1_loss(v, target_vs)
+        if USE_VALUE_TARGET_NORM and self.value_rms is not None:
+            # Update stats on raw targets, then normalize both sides. This keeps the model's value
+            # output in the original (raw-return) scale while improving gradient conditioning.
+            self.value_rms.update(target_vs.detach())
+            mean = float(self.value_rms.mean)
+            std = float(self.value_rms.std)
+            v_n = (v - mean) / std
+            t_n = (target_vs - mean) / std
+            loss_v = F.smooth_l1_loss(v_n, t_n)
+        else:
+            loss_v = F.smooth_l1_loss(v, target_vs)
         loss_p = -torch.sum(target_pis * p) / target_pis.size(0)
         
         total_loss = VALUE_LOSS_WEIGHT * loss_v + loss_p
@@ -575,7 +855,13 @@ class Trainer:
         filename = os.path.join(self.run_dir, "training_report.csv")
         file_exists = os.path.isfile(filename)
         
-        fieldnames = ['Gen', 'AvgScore', 'MaxScore', 'MinScore', 'Loss', 'PolicyLoss', 'ValueLoss', 'PredAcc', 'Games', 'Time', 'AvgSteps', 'AvgEntropy', 'DeathWall', 'DeathBody', 'DeathTimeout', 'DeathStarvation', 'DeathWon']
+        fieldnames = [
+            'Gen', 'AvgScore', 'MaxScore', 'MinScore',
+            'Loss', 'PolicyLoss', 'ValueLoss', 'PredAcc',
+            'Games', 'Time', 'AvgSteps', 'AvgEntropy',
+            'ValueNormMean', 'ValueNormStd',
+            'DeathWall', 'DeathBody', 'DeathTimeout', 'DeathStarvation', 'DeathWon',
+        ]
         
         # Check if we need to update headers for existing file
         if file_exists:
@@ -610,6 +896,39 @@ class Trainer:
     def save_model(self):
         path = os.path.join(self.run_dir, "snake_net.pth")
         torch.save(self.model.state_dict(), path)
+    
+    def save_best_model(self):
+        path = os.path.join(self.run_dir, "best_snake_net.pth")
+        torch.save(self.model.state_dict(), path)
+    
+    def update_best_from_benchmark(self, benchmark_row):
+        """
+        Update best model based on benchmark results (more reliable than self-play avg_score).
+        Prioritizes WinPct, then AvgScore from benchmark.
+        """
+        bench_winpct = float(benchmark_row.get('WinPct', 0.0))
+        bench_avgscore = float(benchmark_row.get('AvgScore', -float('inf')))
+        
+        # Prioritize WinPct (most important metric), then AvgScore
+        should_save = False
+        reason = ""
+        
+        if bench_winpct > self.best_benchmark_winpct:
+            should_save = True
+            reason = f"WinPct: {bench_winpct:.1f}% (previous best: {self.best_benchmark_winpct:.1f}%)"
+            self.best_benchmark_winpct = bench_winpct
+            self.best_benchmark_score = bench_avgscore
+        elif bench_winpct == self.best_benchmark_winpct and bench_avgscore > self.best_benchmark_score:
+            # Same WinPct but better AvgScore
+            should_save = True
+            reason = f"WinPct: {bench_winpct:.1f}%, AvgScore: {bench_avgscore:.2f} (previous: {self.best_benchmark_score:.2f})"
+            self.best_benchmark_score = bench_avgscore
+        
+        if should_save:
+            self.save_best_model()
+            print(f"New best model saved from benchmark! {reason}")
+            return True
+        return False
 
 def get_run_dir(base_dir="experiments", resume_version=None):
     os.makedirs(base_dir, exist_ok=True)
@@ -650,6 +969,103 @@ def get_run_dir(base_dir="experiments", resume_version=None):
         return run_dir, False
 
 
+def _list_experiment_runs(base_dir: str):
+    """
+    Return experiment directories as a list sorted by newest first.
+    Each item: dict(name, path, version, mtime).
+    """
+    runs = []
+    if not os.path.isdir(base_dir):
+        return runs
+    for d in os.listdir(base_dir):
+        match = re.match(r"train_v(\d+)$", d)
+        if not match:
+            continue
+        p = os.path.join(base_dir, d)
+        if not os.path.isdir(p):
+            continue
+        try:
+            mtime = os.path.getmtime(p)
+        except OSError:
+            mtime = 0.0
+        runs.append(
+            {
+                "name": d,
+                "path": p,
+                "version": int(match.group(1)),
+                "mtime": float(mtime),
+            }
+        )
+    runs.sort(key=lambda r: r["mtime"], reverse=True)
+    return runs
+
+
+def choose_run_dir(base_dir: str, *, prefer_new: bool) -> tuple[str, bool]:
+    """
+    Interactive selection of an experiment directory.
+    - Ordered by newest (mtime).
+    - Lets the user choose an existing run or create a new one.
+    Returns (run_dir, is_resume).
+
+    If stdin isn't interactive, defaults to NEW run.
+    """
+    runs = _list_experiment_runs(base_dir)
+    versions = [r["version"] for r in runs]
+    new_version = (max(versions) + 1) if versions else 1
+    new_name = f"train_v{new_version}"
+    new_path = os.path.join(base_dir, new_name)
+
+    if not sys.stdin.isatty():
+        os.makedirs(new_path, exist_ok=True)
+        return new_path, False
+
+    if runs:
+        print("\nSelect experiment run (newest first):", flush=True)
+        print(f"  [0] NEW: {new_name}", flush=True)
+        for idx, r in enumerate(runs, start=1):
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["mtime"])) if r["mtime"] else "unknown"
+            print(f"  [{idx}] {r['name']}  (modified {ts})", flush=True)
+    else:
+        print("\nNo existing experiments found.", flush=True)
+        print(f"  [0] NEW: {new_name}", flush=True)
+
+    default_idx = 0 if prefer_new else (1 if runs else 0)
+    default_label = "NEW" if default_idx == 0 else runs[default_idx - 1]["name"]
+    prompt = f"Choice [default {default_idx}={default_label}]: "
+
+    while True:
+        choice = input(prompt).strip()
+        if choice == "":
+            choice = str(default_idx)
+
+        # Allow: index number (0..N)
+        if choice.isdigit():
+            n = int(choice)
+            if n == 0:
+                os.makedirs(new_path, exist_ok=True)
+                return new_path, False
+            if 1 <= n <= len(runs):
+                return runs[n - 1]["path"], True
+
+            # Allow: direct version number (e.g. "25" -> train_v25)
+            if n > 0:
+                direct = os.path.join(base_dir, f"train_v{n}")
+                if os.path.isdir(direct):
+                    return direct, True
+                print(f"Invalid choice: train_v{n} not found.", flush=True)
+                continue
+
+        # Allow: "train_v25"
+        if re.match(r"^train_v\d+$", choice):
+            direct = os.path.join(base_dir, choice)
+            if os.path.isdir(direct):
+                return direct, True
+            print(f"Invalid choice: {choice} not found.", flush=True)
+            continue
+
+        print("Invalid choice. Enter an index number (e.g. 0, 1, 2...) or a version (e.g. 25).", flush=True)
+
+
 if __name__ == "__main__":
     print("Starting main execution...", flush=True)
     # Required for Windows multiprocessing
@@ -664,6 +1080,7 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=None, help="Number of worker processes.")
     parser.add_argument("--board-size", type=int, default=6, help="Board size to train on (e.g. 6 for easier perfect-play learning)")
     parser.add_argument("--fast", action="store_true", help="Compute-efficient preset (recommended for laptops)")
+    parser.add_argument("--dev", action="store_true", help="Dev mode: very fast iterations for testing changes (~3-5x faster, minimal impact on learning)")
     parser.add_argument("--sims", type=int, default=None, help="Base simulations per move (disables schedule if set)")
     parser.add_argument("--games", type=int, default=None, help="Games per generation (disables schedule if set)")
     parser.add_argument("--epochs", type=int, default=None, help="Epochs per generation")
@@ -673,9 +1090,42 @@ if __name__ == "__main__":
     parser.add_argument("--infer-batch", type=int, default=None, help="Max inference batch size")
     parser.add_argument("--infer-wait-empty", type=float, default=None, help="Queue wait (seconds) when empty")
     parser.add_argument("--infer-wait-nonempty", type=float, default=None, help="Queue wait (seconds) when already batching")
+    parser.add_argument("--infer-mode", type=str, default=None, choices=["central", "worker"], help="Inference mode: central (batched in main) or worker (local per worker)")
+    parser.add_argument("--value-norm", action="store_true", help="Normalize value targets with running mean/std (Phase 2.2)")
+    parser.add_argument("--gens", type=int, default=None, help="Run N generations then exit (useful for smoke tests)")
+    parser.add_argument("--benchmark", action="store_true", help="Run deterministic benchmark and append to benchmark.csv")
+    parser.add_argument("--bench-only", action="store_true", help="Run benchmark once and exit (no training)")
+    parser.add_argument("--bench-every", type=int, default=1, help="Run benchmark every N generations (when --benchmark enabled)")
+    parser.add_argument("--bench-episodes", type=int, default=50, help="Benchmark episodes (fixed for comparability)")
+    parser.add_argument("--bench-sims", type=int, default=128, help="Benchmark MCTS sims per move (fixed for comparability)")
+    parser.add_argument("--bench-seed", type=int, default=0, help="Benchmark base seed (fixed for comparability)")
+    parser.add_argument("--multi-size", action="store_true", help="Enable multi-size board training (curriculum learning)")
+    parser.add_argument("--board-sizes", type=int, nargs="+", default=[6, 8, 10], help="Board sizes to use when --multi-size is enabled")
+    parser.add_argument("--curriculum-mode", type=str, default="progressive", choices=["progressive", "mixed"], help="Curriculum mode: progressive (grow over time) or mixed (random mix)")
+    parser.add_argument("--curriculum-start", type=int, default=6, help="Starting board size for progressive curriculum")
+    parser.add_argument("--curriculum-end", type=int, default=10, help="Ending board size for progressive curriculum")
+    parser.add_argument("--curriculum-ramp", type=int, default=50, help="Generations to ramp from start to end size")
     args = parser.parse_args()
 
     # Apply CLI overrides / presets (module-level globals)
+    if args.dev:
+        # Dev mode: optimized for fast iteration when testing changes
+        # Reduces compute by ~3-5x while maintaining learning signal quality
+        DEV_MODE = True
+        LR = 5e-4
+        BATCH_SIZE = 128
+        MEMORY_SIZE = 20000  # Smaller buffer for faster training
+        EPOCHS = 1  # Single epoch is usually enough
+        SIMS_START = 32
+        SIMS_MID = 64
+        SIMS_END = 96
+        SIMS_ENDGAME_MULT = 1  # Disable endgame boost in dev mode
+        GAMES_START = 8
+        GAMES_END = 16
+        INFER_MAX_BATCH = 64
+        print("Dev mode enabled: Fast iteration mode (~3-5x faster)")
+        print("  Games: 8-16, Sims: 32-96, Epochs: 1, Memory: 20k")
+    
     if args.fast:
         # Aim: reach "fill board once" quickly without melting your CPU.
         LR = 5e-4
@@ -704,6 +1154,22 @@ if __name__ == "__main__":
         INFER_TIMEOUT_EMPTY = float(args.infer_wait_empty)
     if args.infer_wait_nonempty is not None:
         INFER_TIMEOUT_NONEMPTY = float(args.infer_wait_nonempty)
+    if args.infer_mode is not None:
+        INFER_MODE = args.infer_mode
+    if args.value_norm:
+        USE_VALUE_TARGET_NORM = True
+    
+    # Multi-size training configuration
+    if args.multi_size:
+        USE_MULTI_SIZE = True
+        BOARD_SIZES = args.board_sizes
+        CURRICULUM_MODE = args.curriculum_mode
+        CURRICULUM_START_SIZE = args.curriculum_start
+        CURRICULUM_END_SIZE = args.curriculum_end
+        CURRICULUM_RAMP_GENS = args.curriculum_ramp
+        print(f"Multi-size training enabled: sizes={BOARD_SIZES}, mode={CURRICULUM_MODE}")
+        if CURRICULUM_MODE == "progressive":
+            print(f"  Progressive curriculum: {CURRICULUM_START_SIZE} -> {CURRICULUM_END_SIZE} over {CURRICULUM_RAMP_GENS} generations")
 
     # If user pins sims/games, treat it as disabling schedules.
     if args.sims is not None:
@@ -718,12 +1184,47 @@ if __name__ == "__main__":
     # If run from snake_ai/ folder, it will be at ./experiments
     # Let's anchor it relative to this file
     base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "experiments")
-    
-    run_dir, is_resume = get_run_dir(base_dir, args.resume)
+
+    if args.resume is not None:
+        run_dir, is_resume = get_run_dir(base_dir, args.resume)
+    elif args.bench_only:
+        # Bench-only should be scriptable/non-interactive: default to the newest existing run.
+        runs = _list_experiment_runs(base_dir)
+        if runs:
+            # Prefer the newest run that actually has weights saved.
+            picked = None
+            for r in runs:
+                if os.path.isfile(os.path.join(r["path"], "snake_net.pth")):
+                    picked = r
+                    break
+
+            if picked is None:
+                run_dir, is_resume = runs[0]["path"], True
+                print(
+                    "WARNING: No saved weights (snake_net.pth) found in any run; "
+                    f"benchmarking untrained model in {os.path.basename(run_dir)}",
+                    flush=True,
+                )
+            else:
+                run_dir, is_resume = picked["path"], True
+                print(f"Benchmark-only: using latest weights from {os.path.basename(run_dir)}", flush=True)
+        else:
+            # Fall back to a new run (benchmarking an untrained model) but warn loudly.
+            run_dir, is_resume = get_run_dir(base_dir, None)
+            print(
+                "WARNING: No existing experiments found; benchmarking an untrained model "
+                f"in {os.path.basename(run_dir)}",
+                flush=True,
+            )
+    else:
+        # Default behavior: start a new run unless explicitly resuming via --resume.
+        run_dir, is_resume = get_run_dir(base_dir, None)
     
     start_gen = 0
     
-    # Pre-loading logic to find start_gen
+    # Pre-loading logic to find start_gen and best metrics
+    best_avg_score_from_history = -float('inf')
+    best_benchmark_from_history = {'WinPct': -float('inf'), 'AvgScore': -float('inf')}
     if is_resume:
         report_path = os.path.join(run_dir, "training_report.csv")
         if os.path.exists(report_path):
@@ -734,8 +1235,48 @@ if __name__ == "__main__":
                     last_row = rows[-1]
                     start_gen = int(last_row['Gen'])
                     print(f"Resuming from Generation {start_gen}")
+                    # Find best avg_score from history (for moving average)
+                    for row in rows:
+                        try:
+                            avg_score = float(row.get('AvgScore', -float('inf')))
+                            if avg_score > best_avg_score_from_history:
+                                best_avg_score_from_history = avg_score
+                        except (ValueError, TypeError):
+                            pass
+        
+        # Load best benchmark metrics if available
+        benchmark_path = os.path.join(run_dir, "benchmark.csv")
+        if os.path.exists(benchmark_path):
+            with open(benchmark_path, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        winpct = float(row.get('WinPct', -float('inf')))
+                        avgscore = float(row.get('AvgScore', -float('inf')))
+                        if winpct > best_benchmark_from_history['WinPct']:
+                            best_benchmark_from_history['WinPct'] = winpct
+                            best_benchmark_from_history['AvgScore'] = avgscore
+                        elif winpct == best_benchmark_from_history['WinPct'] and avgscore > best_benchmark_from_history['AvgScore']:
+                            best_benchmark_from_history['AvgScore'] = avgscore
+                    except (ValueError, TypeError):
+                        pass
     
     trainer = Trainer(run_dir, start_gen=start_gen, num_workers=args.workers, board_size=args.board_size)
+    if is_resume:
+        # Initialize moving average with recent history
+        if best_avg_score_from_history > -float('inf'):
+            # Fill window with best score (conservative initialization)
+            for _ in range(min(5, start_gen)):
+                trainer.avg_score_window.append(best_avg_score_from_history)
+            trainer.best_moving_avg_score = best_avg_score_from_history
+            trainer.best_avg_score = best_avg_score_from_history
+            print(f"Best moving avg_score from history: {best_avg_score_from_history:.2f}")
+        
+        # Initialize benchmark metrics
+        if best_benchmark_from_history['WinPct'] > -float('inf'):
+            trainer.best_benchmark_winpct = best_benchmark_from_history['WinPct']
+            trainer.best_benchmark_score = best_benchmark_from_history['AvgScore']
+            print(f"Best benchmark from history: WinPct={best_benchmark_from_history['WinPct']:.1f}%, AvgScore={best_benchmark_from_history['AvgScore']:.2f}")
     
     # Load previous model if exists
     model_path = os.path.join(run_dir, "snake_net.pth")
@@ -748,14 +1289,66 @@ if __name__ == "__main__":
             print("This usually means the model architecture changed (e.g., input channels/features).")
             print("Start a new run (no --resume) or keep the old code for that run.")
             print(f"Details: {e}")
-            raise
+            # For benchmark-only runs, prefer producing a result over crashing.
+            # (Benchmarking an untrained model is still useful as a sanity check.)
+            if args.bench_only:
+                print("Continuing with randomly-initialized weights for benchmark-only.", flush=True)
+            else:
+                raise
+
+    # Benchmark-only mode: load weights (if present), run deterministic benchmark once, then exit.
+    if args.bench_only:
+        cfg = BenchmarkConfig(
+            board_size=int(args.board_size),
+            episodes=int(args.bench_episodes),
+            sims=int(args.bench_sims),
+            seed=int(args.bench_seed),
+        )
+        # We store Gen as whatever generation index the trainer is currently at (i.e., the next gen to run).
+        # This matches the rest of the script where benchmark is run after a generation completes.
+        gen_idx = int(trainer.generation)
+        bench_row = run_benchmark(trainer.model, cfg, generation=gen_idx)
+        bench_path = append_benchmark_csv(trainer.run_dir, bench_row)
+        print(
+            f"Benchmark saved: {bench_path} | "
+            f"Win%={bench_row['WinPct']:.1f} AvgScore={bench_row['AvgScore']:.2f} "
+            f"(Eps={cfg.episodes} Sims={cfg.sims} Seed={cfg.seed})",
+            flush=True,
+        )
+        raise SystemExit(0)
     
     print("Starting Training Loop (Ctrl+C to stop)...")
     try:
+        gens_target = args.gens
+        gens_done = 0
         while True:
             trainer.train_generation()
             trainer.save_model()
             trainer.save_report()
+
+            if args.benchmark and (int(args.bench_every) > 0):
+                gen_idx = int(trainer.generation)  # generation increments at end of train_generation
+                if (gen_idx % int(args.bench_every)) == 0:
+                    cfg = BenchmarkConfig(
+                        board_size=int(args.board_size),
+                        episodes=int(args.bench_episodes),
+                        sims=int(args.bench_sims),
+                        seed=int(args.bench_seed),
+                    )
+                    bench_row = run_benchmark(trainer.model, cfg, generation=gen_idx)
+                    bench_path = append_benchmark_csv(trainer.run_dir, bench_row)
+                    print(
+                        f"Benchmark saved: {bench_path} | "
+                        f"Win%={bench_row['WinPct']:.1f} AvgScore={bench_row['AvgScore']:.2f} "
+                        f"(Eps={cfg.episodes} Sims={cfg.sims} Seed={cfg.seed})",
+                        flush=True,
+                    )
+                    # Update best model based on benchmark (more reliable than self-play)
+                    trainer.update_best_from_benchmark(bench_row)
+
+            gens_done += 1
+            if gens_target is not None and gens_done >= int(gens_target):
+                break
             
     except KeyboardInterrupt:
         print("\nTraining interrupted. Saving progress...")
