@@ -22,6 +22,7 @@ from model import SnakeNet
 from mcts import MCTS
 from benchmark import BenchmarkConfig, append_benchmark_csv, run_benchmark
 from encoder import encode_pov
+from shm_ipc import SHMManager, SHMWorkerClient
 
 # Hyperparameters (defaults; override via CLI)
 LR = 5e-4
@@ -194,10 +195,12 @@ def play_games_worker(
     result_queue,
     infer_mode="central",
     model_state_dict=None,
+    obs_shm_name=None,
 ):
     """
     Worker function to play games in a dedicated process.
-    Uses batched inference by sending states to the main process via queues.
+    Uses Shared Memory IPC for zero-copy observation transfer and
+    AsyncSHMClient for parallel in-flight MCTS simulations via Virtual Loss.
 
     IMPORTANT: Each process must have a unique (worker_id, response_queue) pair.
     This avoids cross-talk where one process consumes another's inference response.
@@ -207,6 +210,8 @@ def play_games_worker(
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+    shm_client = None  # Track for cleanup
 
     # Prediction client
     if infer_mode == "worker":
@@ -227,8 +232,49 @@ def play_games_worker(
                 p, v = local_model(x)
             p = torch.exp(p).squeeze(0).cpu().numpy()
             return p, float(v.item())
+    elif obs_shm_name is not None:
+        # Central mode with Shared Memory: zero-copy observation transfer.
+        # Workers write observations directly to shared memory, then put only
+        # their worker_id on the request queue (no serialization of tensors).
+        shm_client = SHMWorkerClient(worker_id, board_size, obs_shm_name)
+
+        class _AsyncSHMClient:
+            """Wraps SHMWorkerClient to support async inference for Virtual Loss."""
+            def __init__(self, client):
+                self.client = client
+                self.is_async = True
+                self._next_req_id = 0
+                self.pending_reqs = []
+
+            def __call__(self, input_tensor):
+                """Synchronous fallback (e.g. root expansion)."""
+                self.client.send_request(input_tensor, request_queue)
+                return self.client.wait_for_response(response_queue)
+
+            def send_async(self, input_tensor):
+                req_id = self._next_req_id
+                self._next_req_id += 1
+                self.client.send_request(input_tensor, request_queue)
+                self.pending_reqs.append(req_id)
+                return req_id
+
+            def poll_results(self, wait=True):
+                if not self.pending_reqs:
+                    return []
+                p, v = self.client.wait_for_response(response_queue)
+                req_id = self.pending_reqs.pop(0)
+                return [(req_id, p, v)]
+
+        async_client = _AsyncSHMClient(shm_client)
+
+        def predict_client(input_tensor):
+            return async_client(input_tensor)
+        # Patch async methods onto the callable so MCTS can detect them
+        predict_client.is_async = True
+        predict_client.send_async = async_client.send_async
+        predict_client.poll_results = async_client.poll_results
     else:
-        # Central mode: send requests to the parent, wait for batched inference response.
+        # Central mode without SHM (legacy fallback): send full tensors through Queue.
         def predict_client(input_tensor):
             request_queue.put((worker_id, input_tensor))
             p, v = response_queue.get()
@@ -262,6 +308,9 @@ def play_games_worker(
             steps = 0
             total_entropy = 0
             move_count = 0
+            total_sims_used = 0
+            guaranteed_win_path = None
+            foresight_steps = 0
             state_tensor = game.reset()
 
             while not game.done:
@@ -272,17 +321,31 @@ def play_games_worker(
                 if USE_SCHEDULES:
                     mcts.n_simulations = get_simulations(generation, len(game.snake), game.board_size)
 
-                action_probs, entropy = mcts.search(game)
-                total_entropy += entropy
-                move_count += 1
-
-                # Apply temperature
-                if temp == 0:
-                    rel_action = np.argmax(action_probs)
+                if guaranteed_win_path:
+                    rel_action = guaranteed_win_path.pop(0)
+                    action_probs = np.zeros(3)
+                    action_probs[rel_action] = 1.0
+                    foresight_steps += 1
                 else:
-                    action_probs = action_probs ** (1 / temp)
-                    action_probs = action_probs / np.sum(action_probs)
-                    rel_action = np.random.choice(len(action_probs), p=action_probs)
+                    action_probs, entropy, win_path, sims_done, _timing = mcts.search(game, num_parallel=8)
+                    total_entropy += entropy
+                    total_sims_used += sims_done
+                    move_count += 1
+
+                    if win_path is not None:
+                        guaranteed_win_path = win_path
+                        rel_action = guaranteed_win_path.pop(0)
+                        action_probs = np.zeros(3)
+                        action_probs[rel_action] = 1.0
+                        foresight_steps += 1
+                    else:
+                        # Apply temperature
+                        if temp == 0:
+                            rel_action = np.argmax(action_probs)
+                        else:
+                            action_probs = action_probs ** (1 / temp)
+                            action_probs = action_probs / np.sum(action_probs)
+                            rel_action = np.random.choice(len(action_probs), p=action_probs)
 
                 # Convert relative action to absolute action
                 abs_action = (game.direction + (rel_action - 1)) % 4
@@ -291,13 +354,16 @@ def play_games_worker(
                 input_state = process_state(game, state_tensor)
 
                 state_tensor, reward, done = game.step(abs_action)
-                mcts.update_root(rel_action)
+                if not guaranteed_win_path:
+                    mcts.update_root(rel_action)
                 steps += 1
 
                 game_memory.append([input_state, action_probs, reward])
 
             avg_entropy = total_entropy / move_count if move_count > 0 else 0
-            result_queue.put((process_game_memory(game_memory), game.score, game.death_reason, avg_entropy, steps))
+            avg_sims = total_sims_used / move_count if move_count > 0 else 0
+            foresight_horizon = foresight_steps
+            result_queue.put((process_game_memory(game_memory), game.score, game.death_reason, avg_entropy, steps, foresight_horizon, avg_sims))
     except KeyboardInterrupt:
         # On Windows spawn, Ctrl+C is often delivered to child processes too.
         # If we don't catch it, multiprocessing prints a noisy traceback for each worker.
@@ -307,6 +373,8 @@ def play_games_worker(
         # Propagate a traceback to the parent so we don't "hang" silently.
         result_queue.put(("__error__", worker_id, traceback.format_exc()))
     finally:
+        if shm_client is not None:
+            shm_client.close()
         result_queue.put(("__done__", worker_id))
 
 def process_state(game, state):
@@ -452,6 +520,8 @@ class Trainer:
         scores = []
         entropies = []
         death_reasons = []
+        foresight_horizons = []
+        sims_list = []
         total_steps = 0
         min_score = float('inf')
         
@@ -469,10 +539,17 @@ class Trainer:
         request_queue = None
         response_queues = None
         model_state_dict = None
+        shm_manager = None
 
         if INFER_MODE == "central":
             request_queue = ctx.Queue()
             response_queues = [ctx.Queue() for _ in range(self.num_workers)]
+            # Shared Memory IPC: allocate per-worker observation buffers.
+            # Use the max board size to handle curriculum mixed sizes.
+            shm_board_size = self.board_size
+            if USE_MULTI_SIZE:
+                shm_board_size = max(BOARD_SIZES)
+            shm_manager = SHMManager(self.num_workers, shm_board_size)
         elif INFER_MODE == "worker":
             # Snapshot model weights once per generation and ship to workers.
             model_state_dict = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
@@ -512,6 +589,7 @@ class Trainer:
                     result_queue,
                     INFER_MODE,
                     model_state_dict,
+                    (shm_manager.obs_shm_names[w_id] if shm_manager is not None else None),
                 ),
             )
             p.daemon = True
@@ -565,9 +643,16 @@ class Trainer:
                     total_inference_batches += 1
                     total_inference_requests += len(batch_reqs)
 
-                    worker_ids = [r[0] for r in batch_reqs]
-                    input_np = np.array([r[1] for r in batch_reqs])
-                    input_tensor = torch.tensor(input_np).to(self.device)
+                    if shm_manager is not None:
+                        # SHM mode: batch_reqs contains worker_ids (ints)
+                        worker_ids = list(batch_reqs)
+                        obs_list = [shm_manager.get_observation(w_id) for w_id in worker_ids]
+                        input_tensor = torch.tensor(np.array(obs_list)).to(self.device)
+                    else:
+                        # Legacy mode: batch_reqs contains (worker_id, observation) tuples
+                        worker_ids = [r[0] for r in batch_reqs]
+                        input_np = np.array([r[1] for r in batch_reqs])
+                        input_tensor = torch.tensor(input_np).to(self.device)
 
                     with torch.no_grad():
                         policies, values = self.model(input_tensor)
@@ -612,11 +697,13 @@ class Trainer:
                             pass
                     raise RuntimeError(f"Worker {w_id} crashed. See traceback above.")
 
-                samples, score, death_reason, entropy, steps_played = msg
+                samples, score, death_reason, entropy, steps_played, foresight_horizon, avg_sims = msg
                 new_samples.extend(samples)
                 scores.append(score)
                 death_reasons.append(death_reason)
                 entropies.append(entropy)
+                foresight_horizons.append(foresight_horizon)
+                sims_list.append(avg_sims)
                 total_steps += steps_played
                 if score < min_score:
                     min_score = score
@@ -689,6 +776,10 @@ class Trainer:
         for p in procs:
             p.join(timeout=5)
 
+        # Clean up shared memory
+        if shm_manager is not None:
+            shm_manager.cleanup()
+
         selfplay_end_time = time.time()
         selfplay_time_s = selfplay_end_time - selfplay_start_time
             
@@ -696,6 +787,8 @@ class Trainer:
         max_score = max(scores)
         avg_steps = total_steps / len(scores)
         avg_entropy = sum(entropies) / len(entropies) if entropies else 0
+        avg_foresight = sum(foresight_horizons) / len(foresight_horizons) if foresight_horizons else 0
+        avg_sims_gen = sum(sims_list) / len(sims_list) if sims_list else 0
         
         # Count death reasons
         death_counts = {
@@ -762,7 +855,8 @@ class Trainer:
         print(f"Stats: LR={current_lr:.2e}, Entropy={avg_entropy:.4f}, Steps={avg_steps:.1f}, PredAcc={avg_pred_acc:.1%}, Deaths={death_counts}")
         print(
             f"Telemetry: InferMode={INFER_MODE} | SelfPlay={selfplay_time_s:.2f}s | Train={train_time_s:.2f}s | "
-            f"InferReq={total_inference_requests} | InferBatches={total_inference_batches} | AvgInferBatch={avg_infer_batch_size:.1f}",
+            f"InferReq={total_inference_requests} | InferBatches={total_inference_batches} | AvgInferBatch={avg_infer_batch_size:.1f} | "
+            f"AvgSims={avg_sims_gen:.1f} | Foresight={avg_foresight:.1f}",
             flush=True,
         )
         if USE_VALUE_TARGET_NORM and self.value_rms is not None:
@@ -773,19 +867,21 @@ class Trainer:
         
         self.history.append({
             'Gen': self.generation + 1, 
-            'AvgScore': avg_score, 
+            'AvgScore': round(avg_score, 2), 
             'MaxScore': max_score, 
             'MinScore': min_score,
-            'Loss': avg_loss,
-            'PolicyLoss': avg_p_loss,
-            'ValueLoss': avg_v_loss,
-            'PredAcc': avg_pred_acc,
+            'Loss': round(avg_loss, 4),
+            'PolicyLoss': round(avg_p_loss, 4),
+            'ValueLoss': round(avg_v_loss, 4),
+            'PredAcc': round(avg_pred_acc, 4),
             'Games': games_this_gen,
-            'Time': duration,
-            'AvgSteps': avg_steps,
-            'AvgEntropy': avg_entropy,
-            'ValueNormMean': (self.value_rms.mean if (USE_VALUE_TARGET_NORM and self.value_rms is not None) else ""),
-            'ValueNormStd': (self.value_rms.std if (USE_VALUE_TARGET_NORM and self.value_rms is not None) else ""),
+            'Time': round(duration, 2),
+            'AvgSteps': round(avg_steps, 2),
+            'AvgEntropy': round(avg_entropy, 4),
+            'AvgSims': round(avg_sims_gen, 2),
+            'Foresight': round(avg_foresight, 2),
+            'ValueNormMean': (round(self.value_rms.mean, 4) if (USE_VALUE_TARGET_NORM and self.value_rms is not None) else ""),
+            'ValueNormStd': (round(self.value_rms.std, 4) if (USE_VALUE_TARGET_NORM and self.value_rms is not None) else ""),
             'DeathWall': death_counts['wall'],
             'DeathBody': death_counts['body'],
             'DeathTimeout': death_counts['timeout'],
@@ -859,6 +955,7 @@ class Trainer:
             'Gen', 'AvgScore', 'MaxScore', 'MinScore',
             'Loss', 'PolicyLoss', 'ValueLoss', 'PredAcc',
             'Games', 'Time', 'AvgSteps', 'AvgEntropy',
+            'AvgSims', 'Foresight',
             'ValueNormMean', 'ValueNormStd',
             'DeathWall', 'DeathBody', 'DeathTimeout', 'DeathStarvation', 'DeathWon',
         ]

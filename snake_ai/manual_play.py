@@ -8,20 +8,25 @@ sys.path.append(os.getcwd())
 
 from snake_ai.game import SnakeGame
 
+import argparse
+
 def manual_play(board_size=10, speed=0.15):
     # Initialize Pygame
     pygame.init()
-    CELL_SIZE = 40
+    # Adjust cell size for larger boards to fit on screen
+    CELL_SIZE = 40 if board_size <= 10 else 30
+    if board_size > 20: CELL_SIZE = 20
+    
     screen_size = board_size * CELL_SIZE
     screen = pygame.display.set_mode((screen_size, screen_size + 100)) # Extra space for text
-    pygame.display.set_caption("Manual Snake Test")
+    pygame.display.set_caption(f"Manual Snake Test ({board_size}x{board_size})")
     font = pygame.font.SysFont(None, 24)
     
     # Game Loop
     game = SnakeGame(board_size=board_size)
     running = True
     
-    print("\n--- MANUAL CHECKLIST ---")
+    print(f"\n--- MANUAL CHECKLIST ({board_size}x{board_size}) ---")
     print("1. [ ] Startup: Verify snake has 3 segments (Green Head + 2 Darker Green Body).")
     print("2. [ ] Movement: Try pressing the arrow key OPPOSITE to current direction.")
     print("       - Expectation: Snake ignores it and continues forward.")
@@ -44,15 +49,6 @@ def manual_play(board_size=10, speed=0.15):
                 elif event.key == pygame.K_q: running = False
 
         # Step
-        # If no input, just continue in current direction (simulating frame advance)
-        # But wait, step takes an 'action'.
-        # In manual play, if no key, we usually send current direction OR nothing.
-        # But game.step logic updates direction = action.
-        # So we should send current direction if no key press?
-        # game.step logic:
-        # if action is valid, direction = action.
-        # if action invalid (180), ignores it, keeps old direction.
-        
         if action == -1:
             action = game.direction # Continue straight
             
@@ -84,7 +80,7 @@ def manual_play(board_size=10, speed=0.15):
             f"Score: {game.score} | Length: {len(game.snake)}",
             "Controls: Arrow Keys",
             "R: Reset | Q: Quit",
-            "CHECK: Try moving backwards!"
+            f"Board: {board_size}x{board_size} | Speed: {speed}s"
         ]
         
         for line in instructions:
@@ -99,7 +95,7 @@ def manual_play(board_size=10, speed=0.15):
             # Show Game Over screen briefly
             screen.fill((50, 0, 0))
             go_text = font.render(f"GAME OVER! Score: {game.score}", True, (255, 255, 255))
-            screen.blit(go_text, (screen_size//2 - 100, screen_size//2))
+            screen.blit(go_text, (max(0, screen_size//2 - 100), screen_size//2))
             pygame.display.flip()
             time.sleep(1)
             game.reset()
@@ -109,4 +105,9 @@ def manual_play(board_size=10, speed=0.15):
     pygame.quit()
 
 if __name__ == "__main__":
-    manual_play()
+    parser = argparse.ArgumentParser(description="Manual Snake Play")
+    parser.add_argument("--board_size", type=int, default=15, help="Size of the board (default: 15)")
+    parser.add_argument("--speed", type=float, default=0.15, help="Seconds per step (default: 0.15)")
+    args = parser.parse_args()
+    
+    manual_play(board_size=args.board_size, speed=args.speed)

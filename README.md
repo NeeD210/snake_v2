@@ -46,6 +46,15 @@ python snake_ai/main.py --board-size 6 --workers 4
 python snake_ai/main.py --board-size 6 --sims 64 --games 12 --epochs 1
 ```
 
+- **Inference mode (throughput tuning)**:
+  - `central` (default): workers send inference requests to the main process (batched).
+  - `worker`: each worker runs inference locally (removes queue/IPC bottlenecks; often faster on CPU).
+
+```bash
+python snake_ai/main.py --board-size 6 --workers 4 --games 12 --sims 64 --epochs 1 --infer-mode central
+python snake_ai/main.py --board-size 6 --workers 4 --games 12 --sims 64 --epochs 1 --infer-mode worker
+```
+
 - **Resume the latest run**:
 
 ```bash
@@ -79,5 +88,9 @@ python snake_ai/manual_play.py
   - more sims only in **endgame** (when filling the board is hard)
   - games/gen ramps up over time
 - If you set `--sims` or `--games`, schedules are disabled for predictable compute.
+
+- Training prints a per-generation **Telemetry** line, e.g.:
+  - `Telemetry: InferMode=... | SelfPlay=...s | Train=...s | InferReq=... | InferBatches=... | AvgInferBatch=...`
+  - If `AvgInferBatch` is low (e.g. ~1–3) in `central` mode, you’re often IPC/latency bound; try `--infer-mode worker`.
 
 

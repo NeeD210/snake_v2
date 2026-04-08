@@ -10,6 +10,7 @@ class SnakeGame:
         """Creates a lightweight copy of the game state."""
         new_game = SnakeGame(self.board_size)
         new_game.snake = self.snake[:] # Shallow copy of list of tuples (tuples are immutable)
+        new_game.occ = set(self.occ)
         new_game.food = self.food
         new_game.done = self.done
         new_game.steps = self.steps
@@ -19,6 +20,7 @@ class SnakeGame:
         new_game.hunger_limit = self.hunger_limit
         new_game.direction = self.direction
         new_game.death_reason = self.death_reason
+        new_game.game_id = self.game_id
         return new_game
 
     def reset(self):
@@ -27,15 +29,15 @@ class SnakeGame:
         # Head at center, body to the left implies facing Right (1)
         start_x, start_y = self.board_size // 2, self.board_size // 2
         
-        # Ensure board is large enough for 3 segments (min 3x3, ideally larger)
         # Segments: Head, Body1, Body2
         self.snake = [
             (start_x, start_y),
             (start_x - 1, start_y),
             (start_x - 2, start_y)
         ]
+        # Occupancy for O(1) collision/valid-move checks.
+        self.occ = set(self.snake)
         
-        self.food = self._place_food()
         self.done = False
         self.steps = 0
         self.max_steps = 100000 # Large limit, relying on starvation instead
@@ -45,15 +47,27 @@ class SnakeGame:
         self.hunger_limit = max(100, self.board_size * self.board_size * 2)
         self.direction = 1 # 1: Right ( Matches the body placement )
         self.death_reason = None # Track why the game ended
+        self.game_id = random.randint(0, 2**31 - 1)  # Unique per game for food variety
+        
+        self.food = self._place_food()
         return self.get_state()
 
     def _place_food(self):
-        """Places food in a random empty location."""
-        while True:
-            food = (random.randint(0, self.board_size - 1),
-                    random.randint(0, self.board_size - 1))
-            if food not in self.snake:
-                return food
+        """Places food deterministically based on current board state."""
+        head = self.snake[0]
+        seed = hash((self.game_id, head, len(self.snake), self.score, self.steps)) & 0x7FFFFFFF
+        rng = np.random.RandomState(seed)
+
+        free = []
+        for y in range(self.board_size):
+            for x in range(self.board_size):
+                if (x, y) not in self.occ:
+                    free.append((x, y))
+        if not free:
+            return self.snake[-1]  # Board full
+
+        idx = rng.randint(0, len(free))
+        return free[idx]
 
     def step(self, action):
         """
@@ -66,17 +80,17 @@ class SnakeGame:
 
         self.steps += 1
         # Small time penalty to discourage loops (still dominated by food/death).
-        step_penalty = -0.01
+        step_penalty = -0.005
         # Starvation check
         if self.steps_since_eaten >= self.hunger_limit:
             self.done = True
             self.death_reason = "starvation"
-            return self.get_state(), -2.0, True
+            return self.get_state(), -1.0, True
             
         if self.steps >= self.max_steps:
             self.done = True
             self.death_reason = "timeout"
-            return self.get_state(), -2.0, True # Should not maximize this, same as starvation
+            return self.get_state(), -1.0, True # Should not maximize this, same as starvation
 
         head_x, head_y = self.snake[0]
         
@@ -105,31 +119,39 @@ class SnakeGame:
             new_head[1] < 0 or new_head[1] >= self.board_size):
             self.done = True
             self.death_reason = "wall"
-            return self.get_state(), -2.0, True
+            return self.get_state(), -1.0, True
 
         # Check collision with self
-        # Note: Moving into the tail is safe because the tail will move away
-        if new_head in self.snake[:-1]:
+        # Note: Moving into the tail is safe only if we are NOT eating
+        # (because then the tail moves away).
+        tail = self.snake[-1]
+        will_eat = (new_head == self.food)
+        if new_head in self.occ and (will_eat or new_head != tail):
              self.done = True
              self.death_reason = "body"
-             return self.get_state(), -2.0, True
+             return self.get_state(), -1.0, True
 
         # Move snake
         self.snake.insert(0, new_head)
+        self.occ.add(new_head)
 
         reward = 0
         # Check food
-        if new_head == self.food:
+        if will_eat:
             self.score += 1
-            reward = 1.0 # Eat
+            reward = 0.2 # Eat
             if len(self.snake) == self.board_size * self.board_size:
                 self.done = True # Victory
                 self.death_reason = "won"
-                return self.get_state(), 2.0, True # Win
+                return self.get_state(), 1.0, True # Win
             self.food = self._place_food()
             self.steps_since_eaten = 0 # Reset hunger
         else:
-            self.snake.pop()
+            tail_removed = self.snake.pop()
+            # If we moved into the tail (legal when not eating), the tail position
+            # remains occupied by the new head, so we must NOT remove it from occ.
+            if tail_removed != new_head:
+                self.occ.remove(tail_removed)
             reward = 0 # Not Dying
             self.steps_since_eaten += 1
 
@@ -139,8 +161,8 @@ class SnakeGame:
         
         # If closer: old > new -> positive reward
         # If further: old < new -> negative reward
-        # Scale 0.05: Enough to guide, not enough to overpower -1.0 death
-        reward += (old_dist - new_dist) * 0.05
+        # Scale 0.01: Enough to guide gently
+        reward += (old_dist - new_dist) * 0.01
         reward += step_penalty
 
         return self.get_state(), reward, False
@@ -170,6 +192,7 @@ class SnakeGame:
         """
         valid = []
         head_x, head_y = self.snake[0]
+        tail = self.snake[-1]
         
         # Actions: 0: Up, 1: Right, 2: Down, 3: Left
         moves = [(0, -1), (1, 0), (0, 1), (-1, 0)]
@@ -177,7 +200,9 @@ class SnakeGame:
         for i, (dx, dy) in enumerate(moves):
             nx, ny = head_x + dx, head_y + dy
             if 0 <= nx < self.board_size and 0 <= ny < self.board_size:
-                if (nx, ny) not in self.snake[:-1]: # Tail will move, so it's safe
+                nxt = (nx, ny)
+                # Moving into tail is only safe if not eating.
+                if nxt not in self.occ or (nxt == tail and nxt != self.food):
                     valid.append(i)
                     
         return valid
@@ -193,6 +218,7 @@ class SnakeGame:
         relative_changes = [-1, 0, 1]
         
         head_x, head_y = self.snake[0]
+        tail = self.snake[-1]
         
         # Directions: 0: Up, 1: Right, 2: Down, 3: Left
         # Deltas for absolute directions
@@ -206,7 +232,8 @@ class SnakeGame:
             nx, ny = head_x + dx, head_y + dy
             
             if 0 <= nx < self.board_size and 0 <= ny < self.board_size:
-                if (nx, ny) not in self.snake[:-1]:
+                nxt = (nx, ny)
+                if nxt not in self.occ or (nxt == tail and nxt != self.food):
                     valid_relative.append(rel_action)
                     
         return valid_relative

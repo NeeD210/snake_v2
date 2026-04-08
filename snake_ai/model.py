@@ -123,7 +123,7 @@ class SnakeNet(nn.Module):
         v = torch.flatten(v, start_dim=1)
         v = F.relu(self.value_fc1(v))
         v = self.value_fc2(v)
-        # Removed Tanh to allow unbounded value estimation (e.g. sum of rewards)
-        # v = torch.tanh(v)
+        # Value is bounded dynamically to [-1, 1]
+        v = torch.tanh(v)
 
         return p, v

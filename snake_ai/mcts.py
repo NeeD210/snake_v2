@@ -2,6 +2,9 @@ import math
 import numpy as np
 import torch
 
+from fast_state import FastSnakeState
+from encoder import encode_pov
+
 class Node:
     def __init__(self, state, parent=None, action_taken=None, prior=0, reward=0):
         self.state = state
@@ -13,6 +16,9 @@ class Node:
         self.children = {} # Map action -> Node
         self.N = 0 # Visit count
         self.Q = 0 # Mean value
+        self.vloss = 0 # Virtual Loss count
+        
+        self.is_dead = False # Dead-End Pruning flag
         
     def is_expanded(self):
         return len(self.children) > 0
@@ -22,36 +28,40 @@ class Node:
         Selects the child with the highest UCB score.
         """
         best_score = -float('inf')
-        best_action = None
-        best_child = None
+        # Fallback if all children are dead (prevents None unpacking crash)
+        best_action = list(self.children.keys())[0] if self.children else None
+        best_child = self.children[best_action] if best_action is not None else None
 
-        # Min-Max Scaling for Q-values
-        # To make Q and U comparable, we normalize Q to [0, 1]
-        
+        # Min-Max Scaling for Q-values (exclude dead nodes so safe nodes scale properly)
         q_values = []
         for child in self.children.values():
-            q_values.append(child.Q)
+            if not getattr(child, 'is_dead', False):
+                q_values.append(child.Q)
             
         if q_values:
             min_q = min(q_values)
             max_q = max(q_values)
         else:
             min_q = 0
-            max_q = 0 # Should not happen if children exist
+            max_q = 0 # Should not happen unless all children are dead
             
         epsilon = 1e-4
 
         for action, child in self.children.items():
-            # Normalize Q
-            if max_q > min_q:
-                normalized_q = (child.Q - min_q) / (max_q - min_q)
+            if getattr(child, 'is_dead', False):
+                score = -float('inf')
             else:
-                normalized_q = 0.5 # Default if all equal
+                # Normalize Q
+                if max_q > min_q:
+                    normalized_q = (child.Q - min_q) / (max_q - min_q)
+                else:
+                    normalized_q = 0.5 # Default if all equal
+                    
+                u = c_puct * child.prior * (math.sqrt(self.N + self.vloss) / (1 + child.N + child.vloss))
                 
-            u = c_puct * child.prior * (math.sqrt(self.N) / (1 + child.N))
-            
-            # Score is Normalized Q + U
-            score = normalized_q + u
+                # Virtual loss: penalize Q to discourage other in-flight sims
+                # (Assuming normalized_q is [0,1], subtracting 1.0 is enough)
+                score = (normalized_q - (1.0 if child.vloss > 0 else 0.0)) + u
             
             if score > best_score:
                 best_score = score
@@ -70,12 +80,16 @@ class Node:
         for action in valid_moves:
              if action not in self.children:
                 # Simulate the next state
-                next_game = game_snapshot.clone()
-                # action is relative (0, 1, 2)
-                abs_action = (next_game.direction + (action - 1)) % 4
-                _, reward, done = next_game.step(abs_action) # Capture specific reward for this transition
-                
-                child_state = next_game.get_state()
+                if isinstance(game_snapshot, FastSnakeState):
+                    reward, _done = game_snapshot.step_relative(action)
+                    child_state = game_snapshot.get_state()
+                    game_snapshot.undo()
+                else:
+                    next_game = game_snapshot.clone()
+                    # action is relative (0, 1, 2)
+                    abs_action = (next_game.direction + (action - 1)) % 4
+                    _, reward, _done = next_game.step(abs_action) # Capture specific reward for this transition
+                    child_state = next_game.get_state()
                 self.children[action] = Node(
                     child_state, 
                     parent=self, 
@@ -92,6 +106,15 @@ class Node:
         self.N += 1
         # Q tracks the average expected return from this state
         self.Q += (value - self.Q) / self.N
+        
+        # Propagation of dead ends
+        if self.is_expanded():
+            all_dead = True
+            for child in self.children.values():
+                if not getattr(child, 'is_dead', False):
+                    all_dead = False
+                    break
+            self.is_dead = all_dead
         
         if self.parent:
             # The value of the parent is This Reward + Discounted Future Value
@@ -124,102 +147,163 @@ class MCTS:
         else:
             self.root = None
 
-    def search(self, game, n_simulations=None):
+    def search(self, game, n_simulations=None, num_parallel=8):
         """
-        Runs MCTS simulations from the current game state.
-        Returns the refined policy (probabilities) and the entropy of the visit counts.
+        Runs MCTS simulations with Virtual Loss to support parallel in-flight inferences.
         """
+        import time
+        start_time = time.perf_counter()
+        self.inf_wait_time = 0.0
+
         sims = self.n_simulations if n_simulations is None else int(n_simulations)
-        if sims <= 0:
-            sims = 1
-        if self.root is None:
-             self.root = Node(game.get_state(), prior=0, reward=0)
-             policy, _ = self.predict(game)
-             valid_moves = game.get_valid_relative_moves()
-             self.root.expand(policy, valid_moves, game)
-             self._add_dirichlet_noise(self.root, valid_moves)
-        else:
-            # Check if root state matches current game state (it might not if we updated root partially)
-            # Actually, update_root should handle it, but if we reset or something...
-            if not np.array_equal(self.root.state, game.get_state()):
-                 self.root = Node(game.get_state(), prior=0, reward=0)
-                 policy, _ = self.predict(game)
-                 valid_moves = game.get_valid_relative_moves()
-                 self.root.expand(policy, valid_moves, game)
-                 self._add_dirichlet_noise(self.root, valid_moves)
+        if sims <= 0: sims = 1
+        
+        # Determine if we can use async (predict_fn must support it)
+        is_async = hasattr(self.predict_fn, 'is_async') and self.predict_fn.is_async
 
-        for _ in range(sims):
-            node = self.root
-            simulation_game = game.clone()
-            
-            # 1. SELECT
-            while node.is_expanded():
-                action, node = node.select(self.c_puct)
-                # action is relative (0, 1, 2)
-                # Convert to absolute for simulation step
-                abs_action = (simulation_game.direction + (action - 1)) % 4
-                simulation_game.step(abs_action)
+        root_sim = FastSnakeState.from_game(game)
 
-            # 2. EVALUATE & BACKUP
-            if simulation_game.done:
-                # Terminal state. Future value is 0.
-                # The node.reward contains the death penalty or food reward.
-                # Update starts recursively from here.
-                node.update(0) 
+        # Root initialization
+        if self.root is None or not np.array_equal(self.root.state, game.get_state()):
+            self.root = Node(game.get_state(), prior=0, reward=0)
+            policy, _ = self.predict(root_sim)
+            valid_moves = root_sim.get_valid_relative_moves()
+            self.root.expand(policy, valid_moves, root_sim)
+            self._add_dirichlet_noise(self.root, valid_moves)
+
+        sims_done = 0
+        sims_started = 0
+        in_flight = [] # List of (actions_taken, node)
+        winning_path = None
+
+        while sims_done < sims:
+            # 1. Fill in-flight pipeline
+            while len(in_flight) < num_parallel and sims_started < sims:
+                node = self.root
+                depth = 0
+                actions_taken = []
+                
+                # SELECT
+                while node.is_expanded():
+                    action, node = node.select(self.c_puct)
+                    root_sim.step_relative(action)
+                    actions_taken.append(action)
+                    depth += 1
+                
+                if root_sim.done:
+                    # Terminal node: sync backup
+                    if root_sim.death_reason == "won":
+                        winning_path = actions_taken.copy()
+                    else:
+                        node.is_dead = True
+                    node.update(0) 
+                    sims_done += 1
+                    # Revert
+                    for _ in range(depth): root_sim.undo()
+                    if winning_path: break
+                else:
+                    # Expansion node: Apply Virtual Loss and push to inference
+                    # Apply VLoss up the path
+                    curr = node
+                    while curr:
+                        curr.vloss += 1
+                        curr = curr.parent
+                    
+                    # Snapshot for expansion
+                    input_tensor = encode_pov(root_sim)
+                    # For a real implementation, we'd queue these. 
+                    # If is_async is false, we just do it sync here but still track flow.
+                    if not is_async:
+                        res = self.predict_fn(input_tensor)
+                        # Remove VLoss immediately
+                        curr = node
+                        while curr:
+                            curr.vloss -= 1
+                            curr = curr.parent
+                        
+                        valid_moves = root_sim.get_valid_relative_moves()
+                        node.expand(res[0], valid_moves, root_sim)
+                        node.update(res[1])
+                        sims_done += 1
+                    else:
+                        # Queue request
+                        req_id = self.predict_fn.send_async(input_tensor)
+                        in_flight.append((req_id, actions_taken, node, depth))
+                    
+                    sims_started += 1
+                    # Revert state for next sim
+                    for _ in range(depth): root_sim.undo()
+
+            if winning_path: break
+            if not in_flight: 
+                if sims_started >= sims: break
                 continue
 
-            # Inference
-            policy, value = self.predict(simulation_game)
-            valid_moves = simulation_game.get_valid_relative_moves()
-            
-            # 3. EXPAND
-            node.expand(policy, valid_moves, simulation_game)
-            
-            # 4. BACKUP
-            # Value from network is the estimated return from that state onwards
-            node.update(value)
+            # 2. Wait for ANY in-flight result
+            # (In synchronous mode, in_flight will be empty, loop will finish via sims_done)
+            if is_async:
+                # This blocks until at least one result is ready
+                results = self.predict_fn.poll_results(wait=True)
+                for req_id, p, v in results:
+                    # Find corresponding in_flight entry
+                    idx = -1
+                    for i, (rid, _, _, _) in enumerate(in_flight):
+                        if rid == req_id:
+                            idx = i; break
+                    if idx == -1: continue
+                    
+                    _, actions, node, depth = in_flight.pop(idx)
+                    
+                    # Remove VLoss
+                    curr = node
+                    while curr:
+                        curr.vloss -= 1
+                        curr = curr.parent
+                    
+                    # Fast-forward sim to this node to get valid moves
+                    for a in actions: root_sim.step_relative(a)
+                    valid_moves = root_sim.get_valid_relative_moves()
+                    node.expand(p, valid_moves, root_sim)
+                    # Backup result
+                    node.update(v)
+                    sims_done += 1
+                    # Revert
+                    for _ in range(depth): root_sim.undo()
+
+            # Early stopping (Entropy-Based)
+            if sims_done >= 5:
+                curr_counts = np.zeros(3)
+                for action, child in self.root.children.items():
+                    curr_counts[action] = child.N
+                sum_counts = np.sum(curr_counts)
+                if sum_counts > 0:
+                    probs = curr_counts / sum_counts
+                    current_entropy = -np.sum(probs * np.log(probs + 1e-8))
+                    if current_entropy < 0.15: break
 
         # Calculate final policy
         counts = np.zeros(3)
-        for action, child in self.root.children.items():
-            counts[action] = child.N
-            
-        if np.sum(counts) > 0:
-            counts = counts / np.sum(counts)
-        else:
-            counts = np.array([0.33, 0.33, 0.33])
-            
+        for action, child in self.root.children.items(): counts[action] = child.N
+        if np.sum(counts) > 0: counts = counts / np.sum(counts)
+        else: counts = np.array([0.33, 0.33, 0.33])
         entropy = -np.sum(counts * np.log(counts + 1e-8))
-        return counts, entropy
+        
+        total_time = time.perf_counter() - start_time
+        search_logic_time = total_time - self.inf_wait_time
+        return counts, entropy, winning_path, sims_done, (search_logic_time, self.inf_wait_time)
 
     def predict(self, game):
-        # Prepare input state
-        state = game.get_state()
-        input_tensor = np.zeros((4, game.board_size, game.board_size), dtype=np.float32)
-
-        # Channel 0: Lifetime/flow of the body (temporal information).
-        # Higher value = will remain occupied longer. Tail has the lowest value.
-        snake = getattr(game, "snake", [])
-        L = len(snake)
-        if L > 1:
-            # Skip head (channel 1 covers it). Encode body segments by remaining "lifetime".
-            for i in range(1, L):
-                x, y = snake[i]
-                input_tensor[0, y, x] = (L - i) / L  # tail ~ 1/L, near head ~ (L-1)/L
-
-        # Channel 1: Head
-        input_tensor[1] = (state == 2).astype(float)
-        # Channel 2: Food
-        input_tensor[2] = (state == 3).astype(float)
-        hunger_limit = max(1, getattr(game, "hunger_limit", 100))
-        hunger = float(getattr(game, "steps_since_eaten", 0)) / hunger_limit
-        input_tensor[3].fill(hunger)
+        import time
+        start_inf = time.perf_counter()
         
-        # Rotate based on direction to enforce POV (Head Up)
-        k = game.direction
-        input_tensor = np.rot90(input_tensor, k, axes=(1, 2)).copy()
+        input_tensor = encode_pov(game)
+        result = self.predict_fn(input_tensor)
         
-        return self.predict_fn(input_tensor)
+        # Attribute wait time to the current search session
+        if hasattr(self, 'inf_wait_time'):
+            self.inf_wait_time += (time.perf_counter() - start_inf)
+            
+        return result
 
     def _default_predict(self, input_tensor):
         input_tensor = torch.tensor(input_tensor).unsqueeze(0).to(self.device)

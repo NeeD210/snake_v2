@@ -57,7 +57,7 @@ The Neural Network acts as a function approximator $f_\theta(s) = (\mathbf{p}, v
 ### 3.3 Architecture
 *   **Type**: Convolutional Neural Network (CNN).
 *   **Layer Channels**: `[4 -> 32 -> 64 -> 64]`.
-    *   Input: 4 Channels (Lifetime Body, Head, Food, Hunger)
+    *   Input: 5 Channels (Body Occupancy, Head, Food, Hunger, Flood)
     *   Hidden Layers: 32, 64, and 64 filters respectively.
 *   **Body**: 3 Convolutional blocks with Batch Normalization and ReLU. This extracts spatial features (e.g., "Food is 3 blocks ahead", "Corner on the left").
 *   **Dual Heads**: The network splits at the end into the Policy and Value heads (a standard "Two-Headed Monster" architecture).
