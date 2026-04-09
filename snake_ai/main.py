@@ -23,6 +23,7 @@ from mcts import MCTS
 from benchmark import BenchmarkConfig, append_benchmark_csv, run_benchmark
 from encoder import encode_pov
 from shm_ipc import SHMManager, SHMWorkerClient
+from encoder import UNIVERSAL_SIZE
 
 # Hyperparameters (defaults; override via CLI)
 LR = 5e-4
@@ -56,13 +57,7 @@ GAMES_END = 50
 # Dev/Quick mode for fast iteration (reduces compute without hurting learning signal)
 DEV_MODE = False  # Enable via --dev flag
 
-# Multi-size board training (curriculum learning)
-USE_MULTI_SIZE = False  # Enable to train on multiple board sizes
-BOARD_SIZES = [6, 8, 10]  # Sizes to use when multi-size is enabled
-CURRICULUM_MODE = "progressive"  # "progressive" (start small, grow) or "mixed" (random mix)
-CURRICULUM_START_SIZE = 6
-CURRICULUM_END_SIZE = 10
-CURRICULUM_RAMP_GENS = 50  # Generations to ramp from start to end size
+
 
 def get_c_puct(generation):
     """
@@ -84,107 +79,51 @@ def get_temperature_threshold(generation):
         return 10
 
 
-def get_simulations(generation: int, snake_len: int, board_size: int) -> int:
+def get_simulations(generation: int, snake_len: int, board_size: int, distillation_base: int = None) -> int:
     """
-    Compute-efficient simulation schedule:
-    - ramp sims up across generations
-    - spend extra compute only in endgame where precision matters
+    New curriculum schedule:
+    - Gen 1-4: 5 sims
+    - Gen 5-9: 10 sims
+    - Gen 10+: 20 sims
+    - If distillation_base is provided, it overrides the generation-based lookup.
     
-    Endgame boost: When snake covers >=75% of the board, simulations are multiplied
-    by SIMS_ENDGAME_MULT. This is critical because:
-    - Endgame requires perfect play to avoid self-collision
-    - More simulations = better pathfinding through tight spaces
-    - Example: 6x6 board (36 cells), threshold = 27 cells (75%)
-              When snake_len >= 27, sims are doubled
+    Endgame boost: still active if snake covers >=75% of the board.
     """
-    if DEV_MODE:
-        # Dev mode: much faster, lower sims
-        if generation < 10:
-            base = max(32, SIMS_START // 2)  # Half the sims
-        elif generation < 30:
-            base = max(64, SIMS_MID // 2)
+    if distillation_base is not None:
+        base = distillation_base
+    elif DEV_MODE:
+        # Dev mode: even lower for testing
+        if generation < 4:
+            base = 3
+        elif generation < 9:
+            base = 5
         else:
-            base = max(96, SIMS_END // 2)
-        # No endgame boost in dev mode
+            base = 10
     else:
-        if generation < 10:
-            base = SIMS_START
-        elif generation < 30:
-            base = SIMS_MID
+        if generation < 4:
+            base = 5
+        elif generation < 9:
+            base = 10
         else:
-            base = SIMS_END
-        
-        # Endgame boost: only when >=75% of the board is filled
-        # This is when precision matters most to avoid self-collision
-        endgame_threshold = int(0.75 * (board_size * board_size))
-        if snake_len >= endgame_threshold:
-            base *= SIMS_ENDGAME_MULT
+            base = 20
+    
+    # Endgame boost: only when >=75% of the board is filled
+    endgame_threshold = int(0.75 * (board_size * board_size))
+    if snake_len >= endgame_threshold:
+        base *= SIMS_ENDGAME_MULT
 
     return int(base)
 
 
 def get_games_per_gen(generation: int) -> int:
-    # Linearly ramp games to stabilize training without exploding early compute.
-    if DEV_MODE:
-        # Dev mode: fewer games, faster iteration
-        if generation <= 0:
-            return max(8, GAMES_START // 2)  # Half the games
-        if generation >= 20:  # Ramp faster in dev mode
-            return max(16, GAMES_END // 2)
-        t = generation / 20.0
-        start = max(8, GAMES_START // 2)
-        end = max(16, GAMES_END // 2)
-        return int(round(start + t * (end - start)))
-    else:
-        if generation <= 0:
-            return GAMES_START
-        if generation >= 30:
-            return GAMES_END
-        t = generation / 30.0
-        return int(round(GAMES_START + t * (GAMES_END - GAMES_START)))
+    # Fixed at 20 always as per new curriculum.
+    return 20
 
-def get_board_size_for_game(generation: int, game_index: int = None) -> int:
-    """
-    Returns the board size for a specific game based on curriculum learning strategy.
-    
-    Args:
-        generation: Current generation number
-        game_index: Optional game index (for mixed mode randomization)
-    
-    Returns:
-        Board size to use for this game
-    """
-    if not USE_MULTI_SIZE:
-        # Single size mode: return the default (will be overridden by Trainer.board_size)
-        return CURRICULUM_START_SIZE
-    
-    if CURRICULUM_MODE == "progressive":
-        # Progressive: start with small boards, gradually increase
-        if generation <= 0:
-            return CURRICULUM_START_SIZE
-        if generation >= CURRICULUM_RAMP_GENS:
-            return CURRICULUM_END_SIZE
-        
-        # Linear interpolation
-        t = generation / CURRICULUM_RAMP_GENS
-        size = CURRICULUM_START_SIZE + t * (CURRICULUM_END_SIZE - CURRICULUM_START_SIZE)
-        # Round to nearest valid size
-        return int(round(size))
-    
-    elif CURRICULUM_MODE == "mixed":
-        # Mixed: randomly sample from BOARD_SIZES
-        if game_index is not None:
-            # Use game_index for deterministic but varied selection
-            np.random.seed(generation * 1000 + game_index)
-        return int(np.random.choice(BOARD_SIZES))
-    
-    else:
-        # Default: use start size
-        return CURRICULUM_START_SIZE
+
 
 def play_games_worker(
     worker_id,
-    board_size,  # Default/fallback size (used if game_queue doesn't specify)
+    board_size,
     simulations,
     generation,
     c_puct,
@@ -196,10 +135,11 @@ def play_games_worker(
     infer_mode="central",
     model_state_dict=None,
     obs_shm_name=None,
+    distillation_sims: int = None,
 ):
     """
     Worker function to play games in a dedicated process.
-    Uses Shared Memory IPC for zero-copy observation transfer and
+    Uses Shared Memory IPC for zero-copy observation transfer (fixed UNIVERSAL_SIZE buffers) and
     AsyncSHMClient for parallel in-flight MCTS simulations via Virtual Loss.
 
     IMPORTANT: Each process must have a unique (worker_id, response_queue) pair.
@@ -236,7 +176,7 @@ def play_games_worker(
         # Central mode with Shared Memory: zero-copy observation transfer.
         # Workers write observations directly to shared memory, then put only
         # their worker_id on the request queue (no serialization of tensors).
-        shm_client = SHMWorkerClient(worker_id, board_size, obs_shm_name)
+        shm_client = SHMWorkerClient(worker_id, obs_shm_name)
 
         class _AsyncSHMClient:
             """Wraps SHMWorkerClient to support async inference for Virtual Loss."""
@@ -291,14 +231,8 @@ def play_games_worker(
             if _game_token is None:
                 break
             
-            # Support dynamic board sizes: game_token can be (game_id, board_size) or just game_id
-            if isinstance(_game_token, tuple):
-                game_id, game_board_size = _game_token
-            else:
-                game_id = _game_token
-                game_board_size = board_size  # Fallback to default
-            
-            game = SnakeGame(board_size=game_board_size)
+            game_id = _game_token
+            game = SnakeGame(board_size=board_size)
 
             # Fresh tree per game (n_simulations may be adjusted per-move if schedules enabled)
             mcts = MCTS(predict_client, n_simulations=simulations, c_puct=c_puct)
@@ -319,7 +253,7 @@ def play_games_worker(
 
                 # Dynamic sims: save compute early-game, spend it late-game
                 if USE_SCHEDULES:
-                    mcts.n_simulations = get_simulations(generation, len(game.snake), game.board_size)
+                    mcts.n_simulations = get_simulations(generation, len(game.snake), game.board_size, distillation_base=distillation_sims)
 
                 if guaranteed_win_path:
                     rel_action = guaranteed_win_path.pop(0)
@@ -498,6 +432,7 @@ class Trainer:
         # Moving average for training avg_score (reduces noise)
         self.avg_score_window = deque(maxlen=5)  # Last 5 generations
         self.best_moving_avg_score = -float('inf')
+        self.distillation_sims = None  # None = not in distillation phase yet
         
         # Determine number of workers
         if num_workers is not None:
@@ -531,7 +466,8 @@ class Trainer:
         
         # Allow schedules to control total self-play work per generation
         games_this_gen = get_games_per_gen(self.generation) if USE_SCHEDULES else GAMES_PER_GEN
-        print(f"Gen {self.generation+1} Params: C_PUCT={current_c_puct:.2f}, TempThreshold={current_temp_threshold}, Games={games_this_gen}")
+        current_sims = get_simulations(self.generation, 0, self.board_size, distillation_base=self.distillation_sims) if USE_SCHEDULES else SIMULATIONS
+        print(f"Gen {self.generation+1} Params: C_PUCT={current_c_puct:.2f}, TempThreshold={current_temp_threshold}, Games={games_this_gen}, Sims={current_sims}")
         
         ctx = mp.get_context("spawn")
         result_queue = ctx.Queue()
@@ -545,11 +481,8 @@ class Trainer:
             request_queue = ctx.Queue()
             response_queues = [ctx.Queue() for _ in range(self.num_workers)]
             # Shared Memory IPC: allocate per-worker observation buffers.
-            # Use the max board size to handle curriculum mixed sizes.
-            shm_board_size = self.board_size
-            if USE_MULTI_SIZE:
-                shm_board_size = max(BOARD_SIZES)
-            shm_manager = SHMManager(self.num_workers, shm_board_size)
+            # Buffers are always UNIVERSAL_SIZE (10x10) regardless of board_size.
+            shm_manager = SHMManager(self.num_workers)
         elif INFER_MODE == "worker":
             # Snapshot model weights once per generation and ship to workers.
             model_state_dict = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
@@ -559,13 +492,7 @@ class Trainer:
         # Dynamic scheduling: shared game queue so workers load-balance automatically.
         game_queue = ctx.Queue()
         for i in range(games_this_gen):
-            if USE_MULTI_SIZE:
-                # Pass (game_id, board_size) tuple for multi-size training
-                game_board_size = get_board_size_for_game(self.generation, game_index=i)
-                game_queue.put((i, game_board_size))
-            else:
-                # Single size: just pass game_id
-                game_queue.put(i)
+            game_queue.put(i)
         # One sentinel per worker so everyone can shut down cleanly.
         for _ in range(self.num_workers):
             game_queue.put(None)
@@ -590,6 +517,7 @@ class Trainer:
                     INFER_MODE,
                     model_state_dict,
                     (shm_manager.obs_shm_names[w_id] if shm_manager is not None else None),
+                    self.distillation_sims,
                 ),
             )
             p.daemon = True
@@ -879,14 +807,14 @@ class Trainer:
             'AvgSteps': round(avg_steps, 2),
             'AvgEntropy': round(avg_entropy, 4),
             'AvgSims': round(avg_sims_gen, 2),
+            'Sims': current_sims,
             'Foresight': round(avg_foresight, 2),
-            'ValueNormMean': (round(self.value_rms.mean, 4) if (USE_VALUE_TARGET_NORM and self.value_rms is not None) else ""),
-            'ValueNormStd': (round(self.value_rms.std, 4) if (USE_VALUE_TARGET_NORM and self.value_rms is not None) else ""),
             'DeathWall': death_counts['wall'],
             'DeathBody': death_counts['body'],
             'DeathTimeout': death_counts['timeout'],
             'DeathStarvation': death_counts['starvation'],
-            'DeathWon': death_counts['won']
+            'DeathWon': death_counts['won'],
+            'DistillationSims': (self.distillation_sims if self.distillation_sims is not None else "")
         })
         
         # Update moving average of avg_score (reduces noise)
@@ -955,9 +883,9 @@ class Trainer:
             'Gen', 'AvgScore', 'MaxScore', 'MinScore',
             'Loss', 'PolicyLoss', 'ValueLoss', 'PredAcc',
             'Games', 'Time', 'AvgSteps', 'AvgEntropy',
-            'AvgSims', 'Foresight',
-            'ValueNormMean', 'ValueNormStd',
+            'AvgSims', 'Sims', 'Foresight',
             'DeathWall', 'DeathBody', 'DeathTimeout', 'DeathStarvation', 'DeathWon',
+            'DistillationSims'
         ]
         
         # Check if we need to update headers for existing file
@@ -1024,8 +952,21 @@ class Trainer:
         if should_save:
             self.save_best_model()
             print(f"New best model saved from benchmark! {reason}")
-            return True
-        return False
+            
+        # Distillation Phase Logic
+        if bench_winpct >= 90.0:
+            if self.distillation_sims is None:
+                # Start distillation from 20 -> 18
+                self.distillation_sims = 18
+                print(f"!!! 90% WinRate reached. Entering Distillation Phase: {self.distillation_sims} sims !!!")
+                should_save = True  # Force a save on phase change
+            elif self.distillation_sims > 0:
+                # Reduce by 2
+                self.distillation_sims -= 2
+                print(f"!!! 90% WinRate maintained. Reducing Distillation Sims: {self.distillation_sims} sims !!!")
+                should_save = True
+
+        return should_save
 
 def get_run_dir(base_dir="experiments", resume_version=None):
     os.makedirs(base_dir, exist_ok=True)
@@ -1175,7 +1116,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", nargs='?', const=-1, type=int, help="Resume training. Optional: provide version number (e.g. 1 for train_v1). Default is latest.")
     parser.add_argument("--workers", type=int, default=None, help="Number of worker processes.")
-    parser.add_argument("--board-size", type=int, default=6, help="Board size to train on (e.g. 6 for easier perfect-play learning)")
+    parser.add_argument("--board-size", type=int, default=10, help="Board size to train on (default 10 for Reverse Curriculum)")
     parser.add_argument("--fast", action="store_true", help="Compute-efficient preset (recommended for laptops)")
     parser.add_argument("--dev", action="store_true", help="Dev mode: very fast iterations for testing changes (~3-5x faster, minimal impact on learning)")
     parser.add_argument("--sims", type=int, default=None, help="Base simulations per move (disables schedule if set)")
@@ -1196,12 +1137,7 @@ if __name__ == "__main__":
     parser.add_argument("--bench-episodes", type=int, default=50, help="Benchmark episodes (fixed for comparability)")
     parser.add_argument("--bench-sims", type=int, default=128, help="Benchmark MCTS sims per move (fixed for comparability)")
     parser.add_argument("--bench-seed", type=int, default=0, help="Benchmark base seed (fixed for comparability)")
-    parser.add_argument("--multi-size", action="store_true", help="Enable multi-size board training (curriculum learning)")
-    parser.add_argument("--board-sizes", type=int, nargs="+", default=[6, 8, 10], help="Board sizes to use when --multi-size is enabled")
-    parser.add_argument("--curriculum-mode", type=str, default="progressive", choices=["progressive", "mixed"], help="Curriculum mode: progressive (grow over time) or mixed (random mix)")
-    parser.add_argument("--curriculum-start", type=int, default=6, help="Starting board size for progressive curriculum")
-    parser.add_argument("--curriculum-end", type=int, default=10, help="Ending board size for progressive curriculum")
-    parser.add_argument("--curriculum-ramp", type=int, default=50, help="Generations to ramp from start to end size")
+
     args = parser.parse_args()
 
     # Apply CLI overrides / presets (module-level globals)
@@ -1256,17 +1192,7 @@ if __name__ == "__main__":
     if args.value_norm:
         USE_VALUE_TARGET_NORM = True
     
-    # Multi-size training configuration
-    if args.multi_size:
-        USE_MULTI_SIZE = True
-        BOARD_SIZES = args.board_sizes
-        CURRICULUM_MODE = args.curriculum_mode
-        CURRICULUM_START_SIZE = args.curriculum_start
-        CURRICULUM_END_SIZE = args.curriculum_end
-        CURRICULUM_RAMP_GENS = args.curriculum_ramp
-        print(f"Multi-size training enabled: sizes={BOARD_SIZES}, mode={CURRICULUM_MODE}")
-        if CURRICULUM_MODE == "progressive":
-            print(f"  Progressive curriculum: {CURRICULUM_START_SIZE} -> {CURRICULUM_END_SIZE} over {CURRICULUM_RAMP_GENS} generations")
+
 
     # If user pins sims/games, treat it as disabling schedules.
     if args.sims is not None:
@@ -1340,6 +1266,14 @@ if __name__ == "__main__":
                                 best_avg_score_from_history = avg_score
                         except (ValueError, TypeError):
                             pass
+                    
+                    # Also check for last distillation state
+                    last_row = rows[-1]
+                    dist_val = last_row.get('DistillationSims', "")
+                    if dist_val != "":
+                        start_distillation_sims = int(dist_val)
+                    else:
+                        start_distillation_sims = None
         
         # Load best benchmark metrics if available
         benchmark_path = os.path.join(run_dir, "benchmark.csv")
@@ -1374,6 +1308,10 @@ if __name__ == "__main__":
             trainer.best_benchmark_winpct = best_benchmark_from_history['WinPct']
             trainer.best_benchmark_score = best_benchmark_from_history['AvgScore']
             print(f"Best benchmark from history: WinPct={best_benchmark_from_history['WinPct']:.1f}%, AvgScore={best_benchmark_from_history['AvgScore']:.2f}")
+
+        if 'start_distillation_sims' in locals() and start_distillation_sims is not None:
+             trainer.distillation_sims = start_distillation_sims
+             print(f"Resuming Distillation Phase: {trainer.distillation_sims} simulations")
     
     # Load previous model if exists
     model_path = os.path.join(run_dir, "snake_net.pth")
@@ -1422,6 +1360,11 @@ if __name__ == "__main__":
             trainer.train_generation()
             trainer.save_model()
             trainer.save_report()
+
+            # Terminate if distillation reached 0
+            if trainer.distillation_sims is not None and trainer.distillation_sims <= 0:
+                print("\n🎉 Training Complete! Model reached 90% WinRate with 0 MCTS simulations.")
+                break
 
             if args.benchmark and (int(args.bench_every) > 0):
                 gen_idx = int(trainer.generation)  # generation increments at end of train_generation

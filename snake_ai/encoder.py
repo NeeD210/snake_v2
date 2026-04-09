@@ -16,6 +16,12 @@ Coord = Tuple[int, int]
 # 4: Action-space ratio at targets          [0,1] (head cell forced to 1)
 NUM_CHANNELS = 5
 
+# Universal viewport size: ALL boards are encoded as (C, 10, 10) tensors.
+# Smaller boards are center-padded with natural wall signals (zeros for
+# body/head/food/flood, uniform scalar for hunger).  This enables a single
+# model to handle any board_size <= 10 without architecture changes.
+UNIVERSAL_SIZE = 10
+
 
 @njit(cache=True)
 def _njit_dir_to_delta(d: int) -> tuple[int, int]:
@@ -181,6 +187,15 @@ def encode_pov(game, state: np.ndarray | None = None) -> np.ndarray:
     # k=1 (Right) -> 1 rot (90 deg CCW) -> Right becomes Up
     k = int(getattr(game, "direction", 0))
     x = np.rot90(x, k, axes=(1, 2)).copy()
+
+    # Universal viewport: center-pad to (C, UNIVERSAL_SIZE, UNIVERSAL_SIZE)
+    if n < UNIVERSAL_SIZE:
+        canvas = np.zeros((NUM_CHANNELS, UNIVERSAL_SIZE, UNIVERSAL_SIZE), dtype=np.float32)
+        offset = (UNIVERSAL_SIZE - n) // 2
+        canvas[:, offset:offset + n, offset:offset + n] = x
+        # Hunger channel (3) fills the entire canvas with the uniform scalar
+        canvas[3].fill(x[3, 0, 0])
+        return canvas
 
     return x
 

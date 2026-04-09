@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from game import SnakeGame
 from model import SnakeNet
 from mcts import MCTS
-from encoder import encode_pov
+from encoder import encode_pov, UNIVERSAL_SIZE
 from schedules import get_mcts_simulations
 
 
@@ -403,7 +403,7 @@ def visualize(
         
         POV_SIZE = 12
         draw_pov(screen, pov_numpy, panel_x, y_offset, POV_SIZE)
-        y_offset += board_size * POV_SIZE + 30
+        y_offset += UNIVERSAL_SIZE * POV_SIZE + 30
         
         # Probabilities
         prob_title = font_bold.render("Decision Matrix", True, TEXT_COLOR)
@@ -477,7 +477,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="snake_ai/experiments/train_v4/snake_net.pth", help="Path to model file")
-    parser.add_argument("--board_size", type=int, default=6, help="Board size")
+    parser.add_argument("--board_size", type=int, default=10, help="Board size")
     parser.add_argument("--speed", "-s", type=float, default=0.2, help="Game speed (seconds per frame)")
     parser.add_argument("--debug-inputs", action="store_true", help="Print input tensors to console for debugging")
     

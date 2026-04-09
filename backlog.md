@@ -31,11 +31,13 @@ This document tracks the evolution of the Snake AI project, categorizing tasks b
 
 | Task | Category | Difficulty | Impact | Status |
 |:---|:---:|:---:|:---:|:---|
-| **Universal 10x10 POV** | Architecture | Medium | High | 📋 Design Phase |
-| *Description:* Update `encode_pov` to always produce a 10x10 tensor, padding smaller boards with wall signals. | | | | |
-| **Reverse Curriculum** | Strategy | Medium | High | 📅 Scheduled |
-| *Description:* Start exclusively on 10x10; master with MCTS, then distill and generalize to 6x6/8x8. | | | | |
-| **Policy Distillation (Phase 2)** | Training | Medium | High | 🚧 In Progress |
+| **Universal 10x10 POV** | Architecture | Medium | High | ✅ Completed |
+| *Description:* `encode_pov` always produces a `(5, 10, 10)` tensor, center-padding smaller boards with wall signals. | | | | |
+| **Reverse Curriculum** | Strategy | Medium | High | ✅ Completed |
+| *Description:* Default to 10x10 training. Removed multi-size curriculum in favor of mastering the full board first. | | | | |
+
+## Epoch 3: Policy Distillation
+| **Policy Distillation** | Training | Medium | High | 🚧 In Progress |
 | *Description:* Implement a standalone "Student" fast-policy network for deployment. | | | | |
 
 ---
@@ -60,6 +62,8 @@ This document tracks the evolution of the Snake AI project, categorizing tasks b
 | **CSV Report Rounding** | 2026-04-08 | Quality of Life |
 | **Pipeline Saturation Monitor** | 2026-04-08 | Bottleneck Visibility |
 | **Shared Memory IPC + Virtual Loss** | 2026-04-08 | **10x10 Viable** |
+| **Universal 10x10 POV** | 2026-04-08 | **Fixed Architecture** |
+| **Reverse Curriculum (10x10 Focus)** | 2026-04-08 | **Strategic Simplification** |
 | **Numba JIT Encoder** | 2026-04-07 | +4x Encoder Speed |
 | **Adaptive Curriculum Learning** | 2026-04-06 | **Game Changer** |
 | **Inhomogeneous Batching** | 2026-04-05 | Critical Stability |
@@ -72,7 +76,7 @@ This document tracks the evolution of the Snake AI project, categorizing tasks b
 ---
 
 > [!IMPORTANT]
-> **Universal Viewport**: The move to a 10x10 fixed POV is a breaking change for the current model architecture. Transition requires a fresh training run starting from Gen 0.
+> **Universal Viewport**: The 10x10 fixed POV is now implemented. All encoder outputs are `(5, 10, 10)`. Existing model weights are **incompatible** — start fresh from Gen 0.
 
 > [!TIP]
 > Use `python snake_ai/profile_throughput.py` to benchmark any optimization before merging.

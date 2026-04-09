@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 INPUT_CHANNELS = 5  # Body occupancy, Head, Food, Hunger, Action ratios
+# All inputs are (INPUT_CHANNELS, 10, 10) thanks to the Universal 10x10 POV encoder.
 
 def _best_group_count(num_channels: int, max_groups: int = 8) -> int:
     """
@@ -35,33 +36,25 @@ class ResidualBlock(nn.Module):
 
 class SnakeNet(nn.Module):
     """
-    Multi-size capable Snake neural network (AlphaZero-style).
+    AlphaZero-style Snake neural network with Universal 10x10 POV.
     
-    ARCHITECTURE FOR MULTI-SIZE SUPPORT:
-    ====================================
-    The model can process boards of different sizes (6x6, 8x8, 10x10, etc.) without
-    architectural changes. This is achieved through:
+    ARCHITECTURE
+    ============
+    All inputs are fixed at (5, 10, 10) thanks to the Universal POV encoder,
+    which center-pads smaller boards to 10x10.  This makes the architecture
+    straightforward:
     
-    1. CONVOLUTIONAL LAYERS (size-agnostic):
-       - All conv layers use padding=1, making them work with any input size
-       - Input: (Batch, 5, H, W) where H=W can vary (6, 8, 10, etc.)
-       - Output after trunk: (Batch, channels, H, W) - same spatial size
+    1. CONVOLUTIONAL TRUNK:
+       - Input: (Batch, 5, 10, 10)
+       - ResNet blocks with padding=1 preserve spatial size
     
-    2. ADAPTIVE POOLING (key to multi-size):
-       - Before FC layers, we use nn.AdaptiveAvgPool2d(adaptive_pool_size)
-       - This reduces ANY spatial size to a fixed size (e.g., 2x2)
-       - Example: 6x6 -> 2x2, 8x8 -> 2x2, 10x10 -> 2x2
-       - This allows the same FC layers to work with any board size
+    2. ADAPTIVE POOLING:
+       - Reduces (10, 10) to a fixed (adaptive_pool_size, adaptive_pool_size)
+       - Kept for future flexibility if input size ever changes
     
-    3. FULLY CONNECTED LAYERS (fixed input size):
-       - FC layers receive fixed-size input from adaptive pooling
-       - Policy: 2 channels * 2*2 = 8 features -> 3 actions
-       - Value: 1 channel * 2*2 = 4 features -> 64 -> 1 value
-    
-    TRAINING WITH MULTI-SIZE:
-    - During training, batches can contain games from different board sizes
-    - The model processes each independently (batch dimension handles this)
-    - This acts as data augmentation and improves generalization
+    3. HEADS:
+       - Policy: 2 channels * pool^2 -> 3 actions (Left/Straight/Right)
+       - Value:  1 channel  * pool^2 -> 64 -> 1 scalar in [-1, 1]
     """
     def __init__(self, board_size: int = 10, channels: int = 64, num_blocks: int = 4, adaptive_pool_size: int = 2):
         """
