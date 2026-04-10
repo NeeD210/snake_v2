@@ -161,6 +161,10 @@ class MCTS:
         # Determine if we can use async (predict_fn must support it)
         is_async = hasattr(self.predict_fn, 'is_async') and self.predict_fn.is_async
 
+        # Safety: non-blocking drain of any stale responses left from a prior search
+        if is_async and hasattr(self.predict_fn, '_drain_stale'):
+            self.predict_fn._drain_stale()
+
         root_sim = FastSnakeState.from_game(game)
 
         # Root initialization
@@ -173,7 +177,7 @@ class MCTS:
 
         sims_done = 0
         sims_started = 0
-        in_flight = [] # List of (actions_taken, node)
+        in_flight = [] # List of (seq_id, actions_taken, node, depth)
         winning_path = None
 
         while sims_done < sims:
@@ -198,6 +202,7 @@ class MCTS:
                         node.is_dead = True
                     node.update(0) 
                     sims_done += 1
+                    sims_started += 1
                     # Revert
                     for _ in range(depth): root_sim.undo()
                     if winning_path: break
@@ -227,8 +232,8 @@ class MCTS:
                         sims_done += 1
                     else:
                         # Queue request
-                        req_id = self.predict_fn.send_async(input_tensor)
-                        in_flight.append((req_id, actions_taken, node, depth))
+                        seq_id = self.predict_fn.send_async(input_tensor)
+                        in_flight.append((seq_id, actions_taken, node, depth))
                     
                     sims_started += 1
                     # Revert state for next sim
@@ -239,20 +244,22 @@ class MCTS:
                 if sims_started >= sims: break
                 continue
 
-            # 2. Wait for ANY in-flight result
-            # (In synchronous mode, in_flight will be empty, loop will finish via sims_done)
+            # 2. Wait for ANY in-flight result (tagged)
             if is_async:
-                # This blocks until at least one result is ready
                 results = self.predict_fn.poll_results(wait=True)
-                for req_id, p, v in results:
-                    # Find corresponding in_flight entry
-                    idx = -1
-                    for i, (rid, _, _, _) in enumerate(in_flight):
-                        if rid == req_id:
-                            idx = i; break
-                    if idx == -1: continue
+                for resp_seq, p, v in results:
+                    # Find matching entry in in_flight
+                    match_idx = -1
+                    for i, (sid, _, _, _) in enumerate(in_flight):
+                        if sid == resp_seq:
+                            match_idx = i
+                            break
                     
-                    _, actions, node, depth = in_flight.pop(idx)
+                    if match_idx == -1:
+                        # Stale response from previous search, ignore
+                        continue
+                    
+                    _, actions, node, depth = in_flight.pop(match_idx)
                     
                     # Remove VLoss
                     curr = node
@@ -280,6 +287,47 @@ class MCTS:
                     probs = curr_counts / sum_counts
                     current_entropy = -np.sum(probs * np.log(probs + 1e-8))
                     if current_entropy < 0.15: break
+
+        # Drain any in-flight async requests that were abandoned due to early
+        # stopping or winning-path break.
+        if is_async and in_flight:
+            drain_start = time.perf_counter()
+            while in_flight:
+                # Fail-safe timeout: 5s
+                if time.perf_counter() - drain_start > 5.0:
+                    print(f"   [MCTS] WARNING: Drain timeout. Abandoning {len(in_flight)} requests.", flush=True)
+                    # Force return slots for abandoned requests
+                    for sid, _, _, _ in in_flight:
+                        if hasattr(self.predict_fn, 'seq_to_slot') and sid in self.predict_fn.seq_to_slot:
+                             s_id = self.predict_fn.seq_to_slot.pop(sid)
+                             self.predict_fn.free_slots.append(s_id)
+                    break
+                    
+                results = self.predict_fn.poll_results(wait=True)
+                for resp_seq, p, v in results:
+                    match_idx = -1
+                    for i, (sid, _, _, _) in enumerate(in_flight):
+                        if sid == resp_seq:
+                            match_idx = i
+                            break
+                    
+                    if match_idx != -1:
+                        _, actions, node, depth = in_flight.pop(match_idx)
+                        # Remove Virtual Loss
+                        curr = node
+                        while curr:
+                            curr.vloss -= 1
+                            curr = curr.parent
+                        # Expand & backup to keep tree consistent
+                        for a in actions:
+                            root_sim.step_relative(a)
+                        valid_moves = root_sim.get_valid_relative_moves()
+                        node.expand(p, valid_moves, root_sim)
+                        node.update(v)
+                        sims_done += 1
+                        for _ in range(depth):
+                            root_sim.undo()
+                    # else: stale response, ignore and loop until in_flight is empty
 
         # Calculate final policy
         counts = np.zeros(3)

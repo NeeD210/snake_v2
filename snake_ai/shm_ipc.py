@@ -4,70 +4,77 @@ import traceback
 
 from encoder import UNIVERSAL_SIZE, NUM_CHANNELS
 
+NUM_SLOTS = 16
+
 class SHMWorkerClient:
-    def __init__(self, worker_id, obs_shm_name):
+    def __init__(self, worker_id, obs_shm_names):
+        """
+        obs_shm_names: list of SHM names for this worker's slots
+        """
         self.worker_id = worker_id
-        self.obs_shm_name = obs_shm_name
+        self.obs_shm_names = obs_shm_names
         
-        # Obs buffer: always (C, UNIVERSAL_SIZE, UNIVERSAL_SIZE) — fixed size for all board sizes
-        obs_size = NUM_CHANNELS * UNIVERSAL_SIZE * UNIVERSAL_SIZE * 4  # float32
-        
-        try:
-            self.obs_shm = shared_memory.SharedMemory(name=self.obs_shm_name)
-        except FileNotFoundError:
-            raise RuntimeError(f"Shared memory not found for worker {worker_id}. Ensure SHMManager is initialized in the master process.")
+        self.obs_shms = []
+        self.obs_bufs = []
 
-        self.obs_buf = np.ndarray((NUM_CHANNELS, UNIVERSAL_SIZE, UNIVERSAL_SIZE), dtype=np.float32, buffer=self.obs_shm.buf)
+        for name in obs_shm_names:
+            try:
+                shm = shared_memory.SharedMemory(name=name)
+                self.obs_shms.append(shm)
+                buf = np.ndarray((NUM_CHANNELS, UNIVERSAL_SIZE, UNIVERSAL_SIZE), dtype=np.float32, buffer=shm.buf)
+                self.obs_bufs.append(buf)
+            except FileNotFoundError:
+                raise RuntimeError(f"Shared memory {name} not found for worker {worker_id}.")
 
-    def send_request(self, observation, request_queue):
-        """Writes observation to SHM and puts worker_id in the queue."""
-        self.obs_buf[:] = observation[:]
-        request_queue.put(self.worker_id)
+    def send_request(self, slot_id, seq_id, observation, request_queue):
+        """Writes observation to specific slot and puts (worker_id, slot_id, seq_id) in the queue."""
+        self.obs_bufs[slot_id][:] = observation[:]
+        request_queue.put((self.worker_id, slot_id, seq_id))
         
     def wait_for_response(self, response_queue):
-        """Waits for the master to signal that the response is ready in the queue."""
-        p, v = response_queue.get()
-        # Return policy and value
-        return p, v
+        """Waits for (seq_id, p, v) in the response queue."""
+        return response_queue.get()
 
     def close(self):
-        self.obs_shm.close()
+        for shm in self.obs_shms:
+            shm.close()
 
 class SHMManager:
-    def __init__(self, num_workers, num_channels=NUM_CHANNELS, ctx=None):
+    def __init__(self, num_workers, num_channels=NUM_CHANNELS):
         import os
         self.num_workers = num_workers
         self.num_channels = num_channels
         self.master_pid = os.getpid()
         
-        self.obs_shms = []
-        self.obs_shm_names = []
+        # Grid of buffers: [worker_id, slot_id]
+        self.obs_shms = [[None for _ in range(NUM_SLOTS)] for _ in range(num_workers)]
+        self.obs_bufs = [[None for _ in range(NUM_SLOTS)] for _ in range(num_workers)]
+        self.obs_shm_names = [[None for _ in range(NUM_SLOTS)] for _ in range(num_workers)]
         
-        self.obs_bufs = []
-        
-        for i in range(num_workers):
-            obs_shm_name = f"snake_obs_p{self.master_pid}_w{i}"
-            self.obs_shm_names.append(obs_shm_name)
-            obs_size = num_channels * UNIVERSAL_SIZE * UNIVERSAL_SIZE * 4
-            
-            # Clean up existing SHM if any
-            try:
-                temp = shared_memory.SharedMemory(name=obs_shm_name)
-                temp.close()
-                temp.unlink()
-            except: pass
+        for w_id in range(num_workers):
+            for s_id in range(NUM_SLOTS):
+                name = f"snake_obs_p{self.master_pid}_w{w_id}_s{s_id}"
+                self.obs_shm_names[w_id][s_id] = name
+                size = num_channels * UNIVERSAL_SIZE * UNIVERSAL_SIZE * 4
+                
+                # Clean up legacy
+                try:
+                    temp = shared_memory.SharedMemory(name=name)
+                    temp.close()
+                    temp.unlink()
+                except: pass
 
-            o_shm = shared_memory.SharedMemory(name=obs_shm_name, create=True, size=obs_size)
-            self.obs_shms.append(o_shm)
-            self.obs_bufs.append(np.ndarray((num_channels, UNIVERSAL_SIZE, UNIVERSAL_SIZE), dtype=np.float32, buffer=o_shm.buf))
+                shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+                self.obs_shms[w_id][s_id] = shm
+                self.obs_bufs[w_id][s_id] = np.ndarray((num_channels, UNIVERSAL_SIZE, UNIVERSAL_SIZE), dtype=np.float32, buffer=shm.buf)
 
-    def get_observation(self, worker_id):
-        return self.obs_bufs[worker_id]
-
-    def set_response(self, response_queue, policy, value):
-        response_queue.put((policy, value))
+    def get_observation(self, worker_id, slot_id):
+        return self.obs_bufs[worker_id][slot_id]
 
     def cleanup(self):
-        for shm in self.obs_shms:
-            shm.close()
-            shm.unlink()
+        for w_id in range(self.num_workers):
+            for s_id in range(NUM_SLOTS):
+                shm = self.obs_shms[w_id][s_id]
+                if shm:
+                    shm.close()
+                    shm.unlink()

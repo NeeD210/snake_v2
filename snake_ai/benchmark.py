@@ -17,7 +17,7 @@ from mcts import MCTS
 class BenchmarkConfig:
     board_size: int = 6
     episodes: int = 50
-    sims: int = 128
+    sims: int = 5
     seed: int = 0
 
 

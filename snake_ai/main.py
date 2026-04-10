@@ -32,7 +32,7 @@ MEMORY_SIZE = 50000
 EPOCHS = 2
 # Only used when schedules are disabled (see USE_SCHEDULES below)
 GAMES_PER_GEN = 20
-SIMULATIONS = 128
+SIMULATIONS = 5
 VALUE_LOSS_WEIGHT = 0.5
 
 # Training stability (optional)
@@ -47,9 +47,6 @@ INFER_MODE = "central"  # "central" (batched inference in main) or "worker" (loc
 
 # Compute-efficient schedules (enabled by default; can be disabled via CLI)
 USE_SCHEDULES = True
-SIMS_START = 64
-SIMS_MID = 128
-SIMS_END = 256  # Increased for better endgame precision
 SIMS_ENDGAME_MULT = 2  # boost sims only when the board is mostly filled (>=75%)
 GAMES_START = 20
 GAMES_END = 50
@@ -183,27 +180,80 @@ def play_games_worker(
             def __init__(self, client):
                 self.client = client
                 self.is_async = True
-                self._next_req_id = 0
-                self.pending_reqs = []
+                self.next_seq_id = 0
+                self.free_slots = list(range(16)) # Support up to 16 in-flight
+                self.seq_to_slot = {}   # seq_id -> slot_id (tracks ALL issued assignments)
+                self.ready_results = {} # seq_id -> (p, v)
+
+            def _read_queue(self, wait=False, timeout=None):
+                """Internal helper to drain response_queue into ready_results buffer."""
+                import time
+                start_read = time.time()
+                
+                # If wait=True, loop until SOMETHING arrives or timeout
+                while wait and not self.ready_results:
+                    try:
+                        resp_seq, p, v = response_queue.get(timeout=0.1)
+                        self.ready_results[resp_seq] = (p, v)
+                        if resp_seq in self.seq_to_slot:
+                            s_id = self.seq_to_slot.pop(resp_seq)
+                            self.free_slots.append(s_id)
+                    except Exception:
+                        if timeout and (time.time() - start_read > timeout):
+                            break
+                        # Important: don't sleep here unless we timed out, 
+                        # just retry the get() which blocks for 0.1s anyway
+                        continue
+                
+                # Drain rest (non-blocking)
+                while True:
+                    try:
+                        resp_seq, p, v = response_queue.get_nowait()
+                        self.ready_results[resp_seq] = (p, v)
+                        if resp_seq in self.seq_to_slot:
+                            s_id = self.seq_to_slot.pop(resp_seq)
+                            self.free_slots.append(s_id)
+                    except Exception:
+                        break
 
             def __call__(self, input_tensor):
                 """Synchronous fallback (e.g. root expansion)."""
-                self.client.send_request(input_tensor, request_queue)
-                return self.client.wait_for_response(response_queue)
+                seq_id = self.send_async(input_tensor)
+                # Sync expansion MUST succeed eventually, but we'll add a safety timeout
+                import time
+                max_wait = 10.0
+                start_w = time.time()
+                while seq_id not in self.ready_results:
+                    self._read_queue(wait=True, timeout=1.0)
+                    if time.time() - start_w > max_wait:
+                        print(f"   [Worker {worker_id}] WARNING: Sync inference timeout (seq={seq_id})", flush=True)
+                        return np.ones(3)/3.0, 0.0 # Random fallback
+                return self.ready_results.pop(seq_id)
 
             def send_async(self, input_tensor):
-                req_id = self._next_req_id
-                self._next_req_id += 1
-                self.client.send_request(input_tensor, request_queue)
-                self.pending_reqs.append(req_id)
-                return req_id
+                if not self.free_slots:
+                    # This should theoretically not be hit if num_parallel < 16
+                    while not self.free_slots: self._read_queue(wait=True)
+                
+                s_id = self.free_slots.pop(0)
+                seq_id = self.next_seq_id
+                self.next_seq_id += 1
+                self.seq_to_slot[seq_id] = s_id
+                self.client.send_request(s_id, seq_id, input_tensor, request_queue)
+                return seq_id
 
             def poll_results(self, wait=True):
-                if not self.pending_reqs:
-                    return []
-                p, v = self.client.wait_for_response(response_queue)
-                req_id = self.pending_reqs.pop(0)
-                return [(req_id, p, v)]
+                """Read available responses. Returns list of (seq_id, p, v)."""
+                self._read_queue(wait=wait)
+                
+                # Return all ready results (MCTS now matches them by ID)
+                items = []
+                for seq_id in list(self.ready_results.keys()):
+                    # Note: We only return results that were requested via send_async
+                    # to keep the sync __call__ separate if needed.
+                    p, v = self.ready_results.pop(seq_id)
+                    items.append((seq_id, p, v))
+                return items
 
         async_client = _AsyncSHMClient(shm_client)
 
@@ -214,11 +264,45 @@ def play_games_worker(
         predict_client.send_async = async_client.send_async
         predict_client.poll_results = async_client.poll_results
     else:
-        # Central mode without SHM (legacy fallback): send full tensors through Queue.
+        # Central mode without SHM (legacy fallback)
+        class _LegacyAsyncClient:
+            def __init__(self):
+                self.is_async = True
+                self.next_seq_id = 0
+                self.ready_results = {}
+            
+            def _read_queue(self, wait=False):
+                if wait and not self.ready_results:
+                    resp_seq, p, v = response_queue.get()
+                    self.ready_results[resp_seq] = (p, v)
+                while not response_queue.empty():
+                    resp_seq, p, v = response_queue.get()
+                    self.ready_results[resp_seq] = (p, v)
+
+            def __call__(self, input_tensor):
+                seq_id = self.send_async(input_tensor)
+                while seq_id not in self.ready_results:
+                    self._read_queue(wait=True)
+                return self.ready_results.pop(seq_id)
+
+            def send_async(self, input_tensor):
+                seq_id = self.next_seq_id
+                self.next_seq_id += 1
+                request_queue.put((worker_id, input_tensor, seq_id))
+                return seq_id
+
+            def poll_results(self, wait=True):
+                self._read_queue(wait=wait)
+                items = [(sid, p, v) for sid, (p, v) in self.ready_results.items()]
+                self.ready_results.clear()
+                return items
+
+        legacy_client = _LegacyAsyncClient()
         def predict_client(input_tensor):
-            request_queue.put((worker_id, input_tensor))
-            p, v = response_queue.get()
-            return p, v
+            return legacy_client(input_tensor)
+        predict_client.is_async = True
+        predict_client.send_async = legacy_client.send_async
+        predict_client.poll_results = legacy_client.poll_results
 
     try:
         # Dynamic scheduling: pull games from a shared queue.
@@ -246,6 +330,8 @@ def play_games_worker(
             guaranteed_win_path = None
             foresight_steps = 0
             state_tensor = game.reset()
+
+            last_heartbeat = time.time()
 
             while not game.done:
                 # Temperature: High exploration early, greedy later
@@ -506,7 +592,7 @@ class Trainer:
                 args=(
                     w_id,
                     self.board_size,
-                    SIMULATIONS,
+                    current_sims, # Correctly pass current_sims
                     self.generation,
                     current_c_puct,
                     current_temp_threshold,
@@ -557,11 +643,11 @@ class Trainer:
                 # Check for requests
                 batch_reqs = []
 
-                # Non-blocking collect up to INFER_MAX_BATCH OR until empty
+                # 1. Collect all available requests (non-blocking)
+                batch_reqs = []
                 while len(batch_reqs) < INFER_MAX_BATCH:
                     try:
-                        timeout = INFER_TIMEOUT_NONEMPTY if len(batch_reqs) > 0 else INFER_TIMEOUT_EMPTY
-                        req = request_queue.get(timeout=timeout)
+                        req = request_queue.get_nowait()
                         batch_reqs.append(req)
                     except queue.Empty:
                         break
@@ -572,14 +658,20 @@ class Trainer:
                     total_inference_requests += len(batch_reqs)
 
                     if shm_manager is not None:
-                        # SHM mode: batch_reqs contains worker_ids (ints)
-                        worker_ids = list(batch_reqs)
-                        obs_list = [shm_manager.get_observation(w_id) for w_id in worker_ids]
+                        # SHM mode: batch_reqs contains (worker_id, slot_id, seq_id) tuples
+                        req_data = list(batch_reqs)
+                        worker_ids = [r[0] for r in req_data]
+                        slot_ids = [r[1] for r in req_data]
+                        seq_ids = [r[2] for r in req_data]
+                        
+                        obs_list = [shm_manager.get_observation(w_id, s_id) for w_id, s_id in zip(worker_ids, slot_ids)]
                         input_tensor = torch.tensor(np.array(obs_list)).to(self.device)
                     else:
-                        # Legacy mode: batch_reqs contains (worker_id, observation) tuples
-                        worker_ids = [r[0] for r in batch_reqs]
-                        input_np = np.array([r[1] for r in batch_reqs])
+                        # Legacy mode: batch_reqs contains (worker_id, observation, seq_id) tuples
+                        req_data = list(batch_reqs)
+                        worker_ids = [r[0] for r in req_data]
+                        seq_ids = [r[2] for r in req_data]
+                        input_np = np.array([r[1] for r in req_data])
                         input_tensor = torch.tensor(input_np).to(self.device)
 
                     with torch.no_grad():
@@ -589,9 +681,19 @@ class Trainer:
                     values = values.cpu().numpy()
 
                     for i, w_id in enumerate(worker_ids):
-                        response_queues[w_id].put((policies[i], values[i].item()))
+                        # Response is (seq_id, policy, value)
+                        try:
+                            response_queues[w_id].put((seq_ids[i], policies[i], values[i].item()), timeout=5.0)
+                        except queue.Full:
+                            print(f"\n[Master] ERROR: Worker {w_id} response queue is FULL. Worker may be deadlocked.", flush=True)
                     last_activity_time = time.time()
                 else:
+                    # Watchdog: Detection logic for stalls
+                    if time.time() - last_activity_time > 60.0:
+                        print(f"\n[Watchdog] ALERT: No inference batches processed for 60s!", flush=True)
+                        print(f"           results_received: {results_received}/{expected_results}", flush=True)
+                        print(f"           request_queue size: ~{request_queue.qsize()}", flush=True)
+                        last_activity_time = time.time() # Only warn every 60s
                     time.sleep(0.001)
             else:
                 # Worker mode: keep loop responsive while workers compute locally.
@@ -814,7 +916,9 @@ class Trainer:
             'DeathTimeout': death_counts['timeout'],
             'DeathStarvation': death_counts['starvation'],
             'DeathWon': death_counts['won'],
-            'DistillationSims': (self.distillation_sims if self.distillation_sims is not None else "")
+            'DistillationSims': (self.distillation_sims if self.distillation_sims is not None else ""),
+            'ValueNormMean': round(self.value_rms.mean, 4) if self.value_rms else "",
+            'ValueNormStd': round(self.value_rms.std, 4) if self.value_rms else ""
         })
         
         # Update moving average of avg_score (reduces noise)
@@ -885,7 +989,7 @@ class Trainer:
             'Games', 'Time', 'AvgSteps', 'AvgEntropy',
             'AvgSims', 'Sims', 'Foresight',
             'DeathWall', 'DeathBody', 'DeathTimeout', 'DeathStarvation', 'DeathWon',
-            'DistillationSims'
+            'DistillationSims', 'ValueNormMean', 'ValueNormStd'
         ]
         
         # Check if we need to update headers for existing file
@@ -1135,7 +1239,7 @@ if __name__ == "__main__":
     parser.add_argument("--bench-only", action="store_true", help="Run benchmark once and exit (no training)")
     parser.add_argument("--bench-every", type=int, default=1, help="Run benchmark every N generations (when --benchmark enabled)")
     parser.add_argument("--bench-episodes", type=int, default=50, help="Benchmark episodes (fixed for comparability)")
-    parser.add_argument("--bench-sims", type=int, default=128, help="Benchmark MCTS sims per move (fixed for comparability)")
+    parser.add_argument("--bench-sims", type=int, default=5, help="Benchmark MCTS sims per move (fixed for comparability)")
     parser.add_argument("--bench-seed", type=int, default=0, help="Benchmark base seed (fixed for comparability)")
 
     args = parser.parse_args()
@@ -1149,9 +1253,6 @@ if __name__ == "__main__":
         BATCH_SIZE = 128
         MEMORY_SIZE = 20000  # Smaller buffer for faster training
         EPOCHS = 1  # Single epoch is usually enough
-        SIMS_START = 32
-        SIMS_MID = 64
-        SIMS_END = 96
         SIMS_ENDGAME_MULT = 1  # Disable endgame boost in dev mode
         GAMES_START = 8
         GAMES_END = 16
@@ -1165,9 +1266,6 @@ if __name__ == "__main__":
         BATCH_SIZE = 128
         MEMORY_SIZE = 30000
         EPOCHS = 1
-        SIMS_START = 48
-        SIMS_MID = 96
-        SIMS_END = 140
         SIMS_ENDGAME_MULT = 2
         GAMES_START = 12
         GAMES_END = 24
